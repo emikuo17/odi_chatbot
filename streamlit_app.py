@@ -1,459 +1,328 @@
-import os
+import json
 import io
 import time
-import textwrap
-from datetime import datetime
+from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
-# Optional TF-IDF retrieval (recommended). If sklearn not installed, we fallback to keyword scoring.
+# --- OPTIONAL: OpenAI SDK (recommended). If you prefer another provider, swap the `call_llm()` function. ---
+# pip install openai
 try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-    SKLEARN_OK = True
+    from openai import OpenAI
 except Exception:
-    SKLEARN_OK = False
+    OpenAI = None
 
 
-# ----------------------------
-# Page config
-# ----------------------------
-st.set_page_config(
-    page_title="AI Customer Support Lab",
-    page_icon="🤖",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-# ----------------------------
-# Dark UI CSS (roughly like your screenshot)
-# ----------------------------
-st.markdown(
-    """
-<style>
-/* Main background */
-.stApp {
-    background: radial-gradient(1200px 800px at 20% 0%, #1b1f2a 0%, #0c0f14 45%, #07090d 100%);
-    color: #eaeef7;
-}
-
-/* Title */
-h1, h2, h3, h4, h5, h6, p, label, div {
-    color: #eaeef7 !important;
-}
-
-/* Inputs */
-textarea, input, .stTextInput input, .stTextArea textarea {
-    background-color: rgba(255,255,255,0.06) !important;
-    color: #eaeef7 !important;
-    border: 1px solid rgba(255,255,255,0.12) !important;
-    border-radius: 12px !important;
-}
-
-/* Selectbox */
-div[data-baseweb="select"] > div {
-    background-color: rgba(255,255,255,0.06) !important;
-    border: 1px solid rgba(255,255,255,0.12) !important;
-    border-radius: 12px !important;
-}
-
-/* Expanders */
-details {
-    background: rgba(255,255,255,0.04) !important;
-    border: 1px solid rgba(255,255,255,0.10) !important;
-    border-radius: 14px !important;
-    padding: 8px 10px !important;
-}
-
-/* Buttons */
-.stButton button {
-    background: #ff5b5b !important;
-    color: #ffffff !important;
-    border: 0 !important;
-    border-radius: 14px !important;
-    padding: 10px 16px !important;
-    font-weight: 700 !important;
-}
-.stButton button:hover {
-    filter: brightness(0.92);
-}
-
-/* Chat bubbles */
-.chat-bubble {
-    border: 1px solid rgba(255,255,255,0.10);
-    background: rgba(255,255,255,0.04);
-    border-radius: 16px;
-    padding: 12px 14px;
-    margin: 8px 0;
-}
-.chat-user {
-    background: rgba(255, 91, 91, 0.10);
-}
-.chat-role {
-    font-size: 12px;
-    opacity: 0.75;
-    margin-bottom: 6px;
-}
-
-/* Footer-ish help text */
-.small-note {
-    font-size: 12px;
-    opacity: 0.8;
-}
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-
-# ----------------------------
+# =========================
 # Helpers
-# ----------------------------
-def now_ts():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+# =========================
+def safe_json_loads(s: str) -> Tuple[Optional[Any], Optional[str]]:
+    try:
+        return json.loads(s), None
+    except Exception as e:
+        return None, str(e)
 
 
-def df_to_row_text(df: pd.DataFrame) -> list[str]:
-    """Convert each row to a single searchable string."""
-    row_texts = []
-    for _, r in df.iterrows():
-        parts = []
-        for c in df.columns:
-            v = r.get(c, "")
-            if pd.isna(v):
-                v = ""
-            parts.append(f"{c}: {str(v)}")
-        row_texts.append(" | ".join(parts))
-    return row_texts
+def df_preview(df: pd.DataFrame, max_rows: int = 10) -> str:
+    if df is None or df.empty:
+        return ""
+    preview = df.head(max_rows).to_markdown(index=False)
+    return preview
 
 
-def retrieve_relevant_rows(df: pd.DataFrame, query: str, k: int = 6) -> pd.DataFrame:
-    """Return top-k relevant rows from df based on query."""
-    if df is None or df.empty or not query.strip():
-        return pd.DataFrame()
-
-    texts = df_to_row_text(df)
-
-    # TF-IDF (best)
-    if SKLEARN_OK:
-        try:
-            vect = TfidfVectorizer(stop_words="english")
-            X = vect.fit_transform(texts)
-            q = vect.transform([query])
-            sims = cosine_similarity(q, X).flatten()
-            top_idx = sims.argsort()[::-1][:k]
-            out = df.iloc[top_idx].copy()
-            out.insert(0, "_score", [float(sims[i]) for i in top_idx])
-            return out
-        except Exception:
-            pass
-
-    # Fallback: simple keyword overlap scoring
-    q_tokens = [t.lower() for t in query.split() if len(t) > 2]
-    scores = []
-    for t in texts:
-        tl = t.lower()
-        score = sum(1 for tok in q_tokens if tok in tl)
-        scores.append(score)
-    top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
-    out = df.iloc[top_idx].copy()
-    out.insert(0, "_score", [scores[i] for i in top_idx])
-    return out
+def dataset_to_compact_context(df: Optional[pd.DataFrame], max_rows: int = 12) -> str:
+    """Turn uploaded dataset into a compact, LLM-friendly context string."""
+    if df is None or df.empty:
+        return ""
+    cols = list(df.columns)
+    ctx = []
+    ctx.append("Uploaded dataset is available. Use it to answer questions when relevant.")
+    ctx.append(f"Columns: {cols}")
+    ctx.append("Top rows (preview):")
+    ctx.append(df.head(max_rows).to_csv(index=False))
+    return "\n".join(ctx)
 
 
-def build_system_prompt(task_def: str, persona: str, tone: str, data_rules: str, context_df: pd.DataFrame) -> str:
-    """Create one consolidated system prompt."""
-    context_block = ""
-    if context_df is not None and not context_df.empty:
-        # Keep context concise: show as bullet-like lines
-        lines = []
-        for _, row in context_df.iterrows():
-            # drop score if present
-            row_dict = row.to_dict()
-            row_dict.pop("_score", None)
-            # prefer "name" if it exists
-            name = str(row_dict.get("name", "")).strip()
-            if name:
-                header = f"PRODUCT: {name}"
-            else:
-                header = "PRODUCT ROW"
-            row_line = " | ".join([f"{k}={row_dict[k]}" for k in row_dict.keys()])
-            lines.append(f"{header}\n{row_line}")
-        context_block = "\n\n".join(lines)
-
-    # Final prompt
-    prompt = f"""
-You are an AI Customer Support assistant.
+def build_system_prompt(task: str, persona: str, tone: str, data_access: str) -> str:
+    # Keep it explicit & structured for the model
+    return f"""
+You are ODI mountain bike grips assistant.
 
 [Task Definition]
-{task_def.strip()}
+{task}
 
 [Customer Persona]
-{persona.strip()}
+{persona}
 
 [Tone & Language Style]
-{tone.strip()}
+{tone}
 
-[Data Access Rules]
-{data_rules.strip()}
+[Data Access / Product Facts]
+{data_access}
 
-[Available Product Data Context]
-{context_block if context_block else "No product rows retrieved for this question. If needed, ask 1 short follow-up question to clarify user needs."}
-
-[Critical Rules]
-- Only use the provided product data context when you recommend products.
-- If product info is missing, ask one clear follow-up question (only one).
-- Do not invent features, prices, sizes, or specs not shown in the data context.
-- Keep answers practical and customer-support-like.
+[Rules]
+- Recommend ODI grips and explain why in MTB terms (feel, damping, tack, flange, diameter, trail type).
+- Ask 1-2 quick clarifying questions ONLY if needed (hand size, glove size, terrain, preference for flange, diameter).
+- If dataset is provided, prefer it as the source of truth for product specs.
+- Be concise but helpful: bullet points + a short recommendation summary.
 """.strip()
 
-    return prompt
 
-
-def call_llm(messages, model: str, temperature: float = 0.2) -> str:
+def call_llm(
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    messages: list,
+    temperature: float = 0.4,
+) -> str:
     """
-    Calls OpenAI using the new SDK if available.
-    Requires OPENAI_API_KEY in environment.
-    """
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        return "⚠️ Missing OPENAI_API_KEY. Set it in your environment and rerun."
+    Uses OpenAI Python SDK if installed. You can swap this out for any provider.
 
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
+    messages: list of dicts like [{"role":"user","content":"..."}, ...]
+    """
+    if OpenAI is None:
+        raise RuntimeError("openai package not installed. Add it to requirements.txt or replace call_llm().")
+
+    client = OpenAI(api_key=api_key)
+
+    # Chat Completions is still widely supported across many installs.
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        messages=[{"role": "system", "content": system_prompt}] + messages,
+    )
+    return resp.choices[0].message.content
+
+
+def init_state():
+    if "chat" not in st.session_state:
+        st.session_state.chat = []  # list of {"role": "...", "content":"..."}
+    if "llm_confirmed" not in st.session_state:
+        st.session_state.llm_confirmed = False
+    if "uploaded_df" not in st.session_state:
+        st.session_state.uploaded_df = None
+    if "last_confirm_result" not in st.session_state:
+        st.session_state.last_confirm_result = ""
+
+
+# =========================
+# Defaults
+# =========================
+DEFAULT_TASK = "You are an ODI mountain bike grips expert who provides grip recommendations to users."
+DEFAULT_PERSONA = "The user is an experienced mountain biker. Use technical terms and slang."
+DEFAULT_TONE = "Respond in a professional and informative tone, similar to a customer service representative."
+
+DEFAULT_DATA_DICT: Dict[str, Any] = {
+    "models": {
+        "ODI Rogue": {
+            "diameter_mm": 33,
+            "feel": "chunky, cushy, high vibration damping",
+            "best_for": ["big hands", "DH", "park", "people who want max cushion"],
+            "notes": ["good shock absorption", "can feel bulky for small hands"],
+        },
+        "ODI Elite Pro": {
+            "diameter_mm": 31,
+            "feel": "tacky, balanced damping, slim-ish",
+            "best_for": ["trail", "enduro", "all-mountain", "control without bulk"],
+            "notes": ["popular all-rounder", "good wet grip"],
+        },
+        "ODI Ruffian": {
+            "diameter_mm": 30,
+            "feel": "thin, precise, firm",
+            "best_for": ["XC", "slopestyle", "riders who like direct bar feel"],
+            "notes": ["less damping", "great feedback"],
+        },
+    },
+    "common_features": [
+        "lock-on grip system",
+        "different diameters change fatigue + control",
+        "flange vs no-flange impacts hand position + comfort",
+    ],
+    "colors": ["Black", "Red", "Graphite", "Light Blue", "Gum Rubber", "Iridescent Purple"],
+    "damping_level": {
+        "thin": "more feedback, less cushion",
+        "medium": "balanced",
+        "thick": "more cushion, less trail buzz",
+    },
+}
+
+DEFAULT_DATA_ACCESS_TEXT = json.dumps(DEFAULT_DATA_DICT, indent=2)
+
+
+# =========================
+# UI
+# =========================
+init_state()
+
+st.set_page_config(page_title="ODI Grips Chatbot", page_icon="🚵", layout="wide")
+st.title("🚵 ODI Grips Chatbot")
+st.caption("Structured prompts + dataset upload + transcript download")
+
+# ---- Sidebar: LLM Config ----
+with st.sidebar:
+    st.header("LLM Settings")
+
+    api_key = st.text_input("API Key", value=st.secrets.get("OPENAI_API_KEY", ""), type="password")
+    model = st.text_input("Model", value=st.secrets.get("OPENAI_MODEL", "gpt-4o-mini"))
+    temperature = st.slider("Temperature", 0.0, 1.0, 0.4, 0.05)
+
+    st.divider()
+
+    # Buttons row (like your 3rd screenshot)
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        if st.button("✅ Confirm LLM Setup", use_container_width=True):
+            if not api_key:
+                st.session_state.llm_confirmed = False
+                st.session_state.last_confirm_result = "Missing API key."
+            else:
+                try:
+                    # Minimal ping message
+                    ping_system = "You are a helpful assistant."
+                    ping_messages = [{"role": "user", "content": "Reply with: LLM OK"}]
+                    out = call_llm(api_key, model, ping_system, ping_messages, temperature=0.0)
+                    st.session_state.llm_confirmed = "LLM OK" in out
+                    st.session_state.last_confirm_result = f"Response: {out}"
+                except Exception as e:
+                    st.session_state.llm_confirmed = False
+                    st.session_state.last_confirm_result = f"Error: {e}"
+
+    with c2:
+        if st.button("🧹 Clear Chat History", use_container_width=True):
+            st.session_state.chat = []
+            st.toast("Chat cleared.")
+
+    with c3:
+        # Generate transcript bytes for download
+        transcript_obj = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "model": model,
+            "temperature": temperature,
+            "messages": st.session_state.chat,
+        }
+        transcript_text = json.dumps(transcript_obj, indent=2)
+
+        st.download_button(
+            "⬇️ Generate Transcript",
+            data=transcript_text.encode("utf-8"),
+            file_name="odi_chat_transcript.json",
+            mime="application/json",
+            use_container_width=True,
         )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        return f"⚠️ LLM call failed: {e}"
+
+    if st.session_state.last_confirm_result:
+        if st.session_state.llm_confirmed:
+            st.success("LLM confirmed.")
+        else:
+            st.warning("LLM not confirmed.")
+        st.caption(st.session_state.last_confirm_result)
 
 
-def format_transcript(chat_history: list[dict]) -> str:
-    lines = []
-    for m in chat_history:
-        lines.append(f"[{m.get('time','')}] {m.get('role','').upper()}: {m.get('content','')}")
-    return "\n\n".join(lines).strip()
+# ---- Main layout ----
+left, right = st.columns([1.15, 0.85], gap="large")
 
-
-# ----------------------------
-# Session State
-# ----------------------------
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []  # list of {role, content, time}
-if "llm_confirmed" not in st.session_state:
-    st.session_state.llm_confirmed = False
-if "uploaded_df" not in st.session_state:
-    st.session_state.uploaded_df = None
-if "setup_snapshot" not in st.session_state:
-    st.session_state.setup_snapshot = {}  # store confirmed prompt inputs
-
-
-# ----------------------------
-# Header
-# ----------------------------
-st.title("AI Customer Support Lab")
-st.markdown('For a quick demo, check out this <a href="#" target="_blank">video</a>.', unsafe_allow_html=True)
-
-# ----------------------------
-# Top controls (class + model)
-# ----------------------------
-colA, colB, colC = st.columns([2.2, 1.3, 1.2])
-
-with colA:
-    selected_class = st.selectbox("Select Class", ["AI in Marketing class", "Other"], index=0)
-
-with colB:
-    model = st.selectbox(
-        "Model",
-        [
-            "gpt-4o-mini",
-            "gpt-4.1-mini",
-            "gpt-4o",
-        ],
-        index=0,
-        help="Pick the model your key has access to.",
-    )
-
-with colC:
-    temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
-
-
-# ----------------------------
-# Structured Prompts
-# ----------------------------
-with st.expander("Structured Prompts", expanded=True):
-    st.subheader("Task Definition")
-    task_def = st.text_area(
-        label="",
-        value=st.session_state.setup_snapshot.get("task_def", "<Task> You are an ODI mountain bike grips expert who provides grip recommendations to users."),
-        height=90,
-    )
-
-    st.subheader("Customer Persona")
-    persona = st.text_area(
-        label=" ",
-        value=st.session_state.setup_snapshot.get(
-            "persona",
-            "<Customer Persona> The user is an experienced mountain biker. Use technical terms and slang.",
-        ),
-        height=90,
-    )
-
-    st.subheader("Tone & Language Style")
-    tone = st.text_area(
-        label="  ",
-        value=st.session_state.setup_snapshot.get(
-            "tone",
-            "<Tone> Respond in a professional and informative tone, similar to a customer service representative.",
-        ),
-        height=90,
-    )
-
-    st.subheader("Data Access")
-    data_rules = st.text_area(
-        label="   ",
-        value=st.session_state.setup_snapshot.get(
-            "data_rules",
-            "<Data> Only recommend grip choices based on the uploaded product CSV. Do not recommend competitors.",
-        ),
-        height=80,
-    )
-
-    uploaded = st.file_uploader(
-        "Upload product CSV (e.g., ODI_MTB_GRIPS.csv)",
-        type=["csv"],
-        accept_multiple_files=False,
-    )
-
-    if uploaded is not None:
+with left:
+    # Structured Prompts block
+    with st.expander("Structured Prompts", expanded=True):
+        # Optional: show your screenshot if you add it
+        # Put your screenshot at: assets/structured_prompts.png
         try:
-            df = pd.read_csv(uploaded)
-            st.session_state.uploaded_df = df
-            st.success(f"Loaded CSV with {df.shape[0]} rows and {df.shape[1]} columns.")
-            with st.expander("Preview uploaded data (first 15 rows)", expanded=False):
-                st.dataframe(df.head(15), use_container_width=True)
-        except Exception as e:
-            st.session_state.uploaded_df = None
-            st.error(f"Failed to read CSV: {e}")
-
-    # If user hasn't uploaded, but you want to auto-load local sample in dev:
-    # (Comment out if you don't want this behavior)
-    if st.session_state.uploaded_df is None and os.path.exists("ODI_MTB_GRIPS.csv"):
-        try:
-            st.session_state.uploaded_df = pd.read_csv("ODI_MTB_GRIPS.csv")
-            st.info("Auto-loaded local ODI_MTB_GRIPS.csv (found in app directory). Upload to replace.")
+            st.image("assets/structured_prompts.png", caption="Structured Prompts UI reference", use_container_width=True)
         except Exception:
             pass
 
+        task = st.text_area("Task Definition", value=DEFAULT_TASK, height=80)
+        persona = st.text_area("Customer Persona", value=DEFAULT_PERSONA, height=80)
+        tone = st.text_area("Tone & Language Style", value=DEFAULT_TONE, height=80)
 
-# ----------------------------
-# Main Buttons row
-# ----------------------------
-b1, b2, b3 = st.columns([1, 1, 1])
+        st.markdown("### Data Access (Editable Dictionary / JSON)")
+        data_access_text = st.text_area(
+            "Paste / edit JSON here",
+            value=DEFAULT_DATA_ACCESS_TEXT,
+            height=260,
+        )
 
-with b1:
-    if st.button("Confirm LLM Setup"):
-        st.session_state.llm_confirmed = True
-        st.session_state.setup_snapshot = {
-            "task_def": task_def,
-            "persona": persona,
-            "tone": tone,
-            "data_rules": data_rules,
-            "model": model,
-            "temperature": temperature,
-            "class": selected_class,
-            "confirmed_at": now_ts(),
-        }
-        st.success("LLM setup confirmed. Chatbot will use these settings.")
+        parsed_data, json_err = safe_json_loads(data_access_text)
+        if json_err:
+            st.error(f"JSON error: {json_err}")
+        else:
+            st.success("JSON looks valid.")
 
-with b2:
-    if st.button("Clear Chat History"):
-        st.session_state.chat_history = []
-        st.session_state.llm_confirmed = False
-        st.info("Chat cleared.")
+    # Dataset upload
+    with st.expander("Dataset Upload", expanded=True):
+        uploaded = st.file_uploader("Upload a dataset (CSV / XLSX / JSON)", type=["csv", "xlsx", "json"])
 
-with b3:
-    transcript_text = format_transcript(st.session_state.chat_history)
-    st.download_button(
-        "Generate Transcript",
-        data=transcript_text if transcript_text else "No chat history yet.",
-        file_name=f"chat_transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-        mime="text/plain",
-    )
+        if uploaded is not None:
+            try:
+                if uploaded.name.lower().endswith(".csv"):
+                    df = pd.read_csv(uploaded)
+                elif uploaded.name.lower().endswith(".xlsx"):
+                    df = pd.read_excel(uploaded)
+                elif uploaded.name.lower().endswith(".json"):
+                    raw = json.load(uploaded)
+                    df = pd.json_normalize(raw) if isinstance(raw, (list, dict)) else pd.DataFrame(raw)
+                else:
+                    df = None
 
-st.markdown('<p class="small-note">Tip: Confirm LLM Setup before chatting (recommended).</p>', unsafe_allow_html=True)
+                st.session_state.uploaded_df = df
+                if df is not None:
+                    st.write("Preview:")
+                    st.dataframe(df.head(25), use_container_width=True)
+            except Exception as e:
+                st.session_state.uploaded_df = None
+                st.error(f"Could not read file: {e}")
 
+        if st.session_state.uploaded_df is not None:
+            st.caption("Dataset context will be included for the chatbot when relevant.")
 
-# ----------------------------
-# Chat Display
-# ----------------------------
-st.markdown("### Chat")
+with right:
+    st.subheader("Chat")
 
-for m in st.session_state.chat_history:
-    role = m["role"]
-    content = m["content"]
-    t = m.get("time", "")
-    bubble_class = "chat-bubble chat-user" if role == "user" else "chat-bubble"
-    st.markdown(
-        f"""
-<div class="{bubble_class}">
-  <div class="chat-role">{role.upper()} • {t}</div>
-  <div>{content.replace("\n","<br>")}</div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+    # Render chat history
+    for m in st.session_state.chat:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
 
-# ----------------------------
-# Chat Input
-# ----------------------------
-user_q = st.chat_input("Which ODI grips would you recommend?")
+    user_msg = st.chat_input("Ask: Which ODI grips would you recommend?")
 
-if user_q:
-    # Save user message
-    st.session_state.chat_history.append({"role": "user", "content": user_q, "time": now_ts()})
+    if user_msg:
+        # Add user message
+        st.session_state.chat.append({"role": "user", "content": user_msg})
+        with st.chat_message("user"):
+            st.markdown(user_msg)
 
-    # Use confirmed snapshot if confirmed, else current inputs
-    if st.session_state.llm_confirmed and st.session_state.setup_snapshot:
-        use_task = st.session_state.setup_snapshot["task_def"]
-        use_persona = st.session_state.setup_snapshot["persona"]
-        use_tone = st.session_state.setup_snapshot["tone"]
-        use_data_rules = st.session_state.setup_snapshot["data_rules"]
-        use_model = st.session_state.setup_snapshot.get("model", model)
-        use_temp = st.session_state.setup_snapshot.get("temperature", temperature)
-    else:
-        use_task = task_def
-        use_persona = persona
-        use_tone = tone
-        use_data_rules = data_rules
-        use_model = model
-        use_temp = temperature
+        # Build system prompt
+        data_ctx = ""
+        if st.session_state.uploaded_df is not None:
+            data_ctx = dataset_to_compact_context(st.session_state.uploaded_df)
 
-    # Retrieve relevant product rows from uploaded CSV
-    df = st.session_state.uploaded_df
-    context_df = retrieve_relevant_rows(df, user_q, k=6) if df is not None else pd.DataFrame()
+        # If JSON invalid, fall back to raw text; otherwise embed the parsed dict nicely.
+        if json_err:
+            data_access_for_prompt = data_access_text
+        else:
+            data_access_for_prompt = json.dumps(parsed_data, indent=2)
 
-    # Build system prompt
-    system_prompt = build_system_prompt(use_task, use_persona, use_tone, use_data_rules, context_df)
+        if data_ctx:
+            data_access_for_prompt = data_access_for_prompt + "\n\n[Uploaded Dataset Context]\n" + data_ctx
 
-    # Build messages for LLM
-    messages = [{"role": "system", "content": system_prompt}]
+        system_prompt = build_system_prompt(task, persona, tone, data_access_for_prompt)
 
-    # Include short history window (avoid huge prompt)
-    history_window = st.session_state.chat_history[-10:]
-    for m in history_window:
-        messages.append({"role": m["role"], "content": m["content"]})
-
-    # Call LLM
-    assistant_text = call_llm(messages, model=use_model, temperature=use_temp)
-
-    # Save assistant message
-    st.session_state.chat_history.append({"role": "assistant", "content": assistant_text, "time": now_ts()})
-
-    # Rerun to display immediately
-    st.rerun()
+        # LLM call
+        with st.chat_message("assistant"):
+            if not api_key:
+                st.error("Add your API key in the sidebar first.")
+            else:
+                try:
+                    assistant_text = call_llm(
+                        api_key=api_key,
+                        model=model,
+                        system_prompt=system_prompt,
+                        messages=st.session_state.chat,  # includes the user's newest message already
+                        temperature=temperature,
+                    )
+                    st.markdown(assistant_text)
+                    st.session_state.chat.append({"role": "assistant", "content": assistant_text})
+                except Exception as e:
+                    st.error(f"LLM error: {e}")
