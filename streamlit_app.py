@@ -191,6 +191,7 @@ if st.button("🔄 Load & Embed CSVs"):
     st.success("Files embedded for RAG.")
 
 # Prompt settings
+with st.expander("🧠 Structured Prompt Controls", expanded=True):
 st.subheader("Structured Prompt Controls")
 task = st.text_area("Task", value=DEFAULT_TASK)
 persona = st.text_area("Persona", value=DEFAULT_PERSONA)
