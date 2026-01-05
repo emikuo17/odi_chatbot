@@ -1,8 +1,9 @@
-# STREAMLIT APP with RAG EXTENSION (minimal fixes for issues 1–5)
+# STREAMLIT APP with RAG EXTENSION (minimal fixes for color + rebuild)
 
 import json
 import time
-from typing import Optional, Dict, List, Any
+import shutil
+from typing import Dict, List
 
 import pandas as pd
 import requests
@@ -31,14 +32,13 @@ def init_state():
     if "vector_db_ready" not in st.session_state:
         st.session_state.vector_db_ready = False
 
+
 # -----------------------
 # RAG Functions
 # -----------------------
 def init_vector_db():
-    # FIX (Issue #2): Use persistent client so embeddings survive reruns/restarts
+    # Persistent client so embeddings survive reruns/restarts
     client = chromadb.PersistentClient(path="chroma_store")
-
-    # FIX (Issue #2): Use get_or_create_collection to avoid recreating each time
     st.session_state.vector_db = client.get_or_create_collection(name="odi-grips")
     st.session_state.vector_db_ready = True
 
@@ -49,10 +49,9 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
 
 def _row_to_product_card(row: pd.Series) -> str:
     """
-    FIX (Issue #5): Cleaner "product card" chunk formatting improves retrieval quality.
-    Uses whichever columns exist; avoids noisy "k: v, k: v" blobs.
+    Product card formatting for embeddings + retrieval.
+    IMPORTANT FIX: includes 'colors'/'Colors' so color queries (e.g., purple) can be retrieved.
     """
-    # Try common name keys if present (doesn't break if missing)
     name_key_candidates = ["product_name", "name", "title", "Product", "Product Name"]
     prod_name = None
     for k in name_key_candidates:
@@ -60,23 +59,33 @@ def _row_to_product_card(row: pd.Series) -> str:
             prod_name = str(row[k]).strip()
             break
 
-    # Compact key fields if they exist in your schema
+    # Include both your schema keys and common variants
     preferred_keys = [
-    "category", "Category",
-    "riding_style", "Riding Style",
-    "locking_mechanism", "Locking Mechanism",
-    "thickness", "Thickness",
-    "damping_level", "Damping Level",
-    "durability", "Durability",
-    "pattern", "Pattern",
-    "compound", "Compound",
-    "material", "Material",
-    "weight", "Weight",
-    "colors", "Colors",     
-    "color", "Color",        
-    "description", "Description",
-    "notes", "Notes",
-    "url", "URL", "link", "Link",
+        "category", "Category",
+        "riding_style", "Riding Style",
+        "locking_mechanism", "Locking Mechanism",
+        "Grip Attachment System", "grip attachment system",
+        "thickness", "Thickness",
+        "damping_level", "Damping Level",
+        "durability", "Durability",
+        "grip_pattern", "Grip Pattern",
+        "pattern", "Pattern",
+        "Feel", "feel",
+        "traction", "Traction",
+        "price", "Price",
+        "ergonomics", "Ergonomics",
+        "key_features", "Key Features",
+        "differentiator", "Differentiator",
+        "co_branding", "Co Branding",
+        "Length", "length",
+
+        # ✅ CRITICAL: colors included
+        "colors", "Colors",
+        "color", "Color",
+
+        "description", "Description",
+        "notes", "Notes",
+        "url", "URL", "link", "Link",
     ]
 
     lines = []
@@ -87,11 +96,9 @@ def _row_to_product_card(row: pd.Series) -> str:
         if k in row.index and pd.notna(row[k]):
             val = str(row[k]).strip()
             if val:
-                # Normalize label to avoid duplicate label variants
                 label = str(k).replace("_", " ").title()
                 lines.append(f"{label}: {val}")
 
-    # Fallback: include a few remaining fields if we found nothing (avoid empty chunks)
     if len(lines) <= 1:
         extras = []
         for k, v in row.items():
@@ -99,7 +106,9 @@ def _row_to_product_card(row: pd.Series) -> str:
                 continue
             if str(k) in preferred_keys:
                 continue
-            extras.append(f"{str(k)}: {str(v).strip()}")
+            vv = str(v).strip()
+            if vv:
+                extras.append(f"{str(k)}: {vv}")
             if len(extras) >= 8:
                 break
         if extras:
@@ -110,16 +119,11 @@ def _row_to_product_card(row: pd.Series) -> str:
 
 
 def add_to_vector_db():
-    # Ensure vector DB exists
     if st.session_state.vector_db is None:
         init_vector_db()
 
-    # FIX (Issue #1): Use stable IDs to avoid duplicates/collisions
-    # FIX (Issue #1): Avoid re-embedding same IDs on repeated "Load & Embed"
     existing_ids = set()
     try:
-        # Chroma may not support listing all IDs in every config;
-        # we guard this to keep it compatible.
         peek = st.session_state.vector_db.peek()
         for _id in peek.get("ids", []):
             existing_ids.add(_id)
@@ -131,7 +135,7 @@ def add_to_vector_db():
     for fname, df in st.session_state.datasets.items():
         df = df.reset_index(drop=True)
         for i, row in df.iterrows():
-            chunk_id = f"{fname}::row-{i}"  # stable
+            chunk_id = f"{fname}::row-{i}"
             if chunk_id in existing_ids:
                 continue
 
@@ -171,13 +175,12 @@ def rag_retrieve_context(query: str, top_k: int = 5) -> str:
     if not docs or not docs[0]:
         return "No matching context."
 
-    # Present as clearly separated product cards
     return "\n\n---\n\n".join(docs[0])
+
 
 # -----------------------
 # Defaults (Structured Prompts)
 # -----------------------
-# FIX (Issue #3): remove accidental string concatenation duplicates
 DEFAULT_TASK = (
     "You are an expert ODI grip specialist helping users of all levels—beginner to expert—"
     "choose the most suitable grip from ODI's product range based strictly on the uploaded CSV dataset. "
@@ -202,6 +205,7 @@ DEFAULT_DATA_RULES = """DATA RULES (STRICT):
 - If a detail is not in the retrieved context, say you’re not sure and ask a clarifying question instead.
 - Only ODI grips are allowed. Never recommend competitor brands.
 - Always recommend at least one specific product name from the retrieved context if a match is found.
+- If the user mentions a color (e.g., purple), prioritize products whose Colors include that color in the retrieved context.
 """
 
 DEFAULT_SCOPE = """SCOPE:
@@ -277,11 +281,8 @@ DEFAULT_OUTPUT_RULES = """RESPONSE FORMAT:
 - Avoid long lists or multiple follow-ups
 """
 
-# -----------------------
-# Prompt Assembly
-# -----------------------
+
 def build_system_prompt(task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, rag_context):
-    # FIX (Issue #4): Do not over-restrict when retrieval is empty; guide fallback behavior
     return f"""
 [Task Definition]
 {task}
@@ -319,10 +320,12 @@ IMPORTANT:
 - Do NOT invent. Do NOT use outside knowledge.
 """.strip()
 
+
 # -----------------------
 # OpenRouter LLM Call
 # -----------------------
-def call_llm_openrouter(api_key: str, model: str, system_prompt: str, messages: List[Dict[str, str]], temperature: float = 0.2, max_tokens: int = 600) -> str:
+def call_llm_openrouter(api_key: str, model: str, system_prompt: str, messages: List[Dict[str, str]],
+                        temperature: float = 0.2, max_tokens: int = 600) -> str:
     url = "https://openrouter.ai/api/v1/chat/completions"
     payload = {
         "model": model,
@@ -342,10 +345,8 @@ def call_llm_openrouter(api_key: str, model: str, system_prompt: str, messages: 
         raise RuntimeError(f"OpenRouter error {resp.status_code}: {resp.text}")
 
     data = resp.json()
-    try:
-        return data["choices"][0]["message"]["content"]
-    except Exception:
-        raise RuntimeError(f"Unexpected response format: {json.dumps(data)[:1200]}")
+    return data["choices"][0]["message"]["content"]
+
 
 # -----------------------
 # Streamlit UI Start
@@ -360,24 +361,35 @@ with st.sidebar:
     api_key = st.text_input("OpenRouter API Key", type="password")
     model = st.text_input("Model", value="openai/gpt-4o-mini")
 
+    # ✅ CRITICAL: Reset Vector DB so updated fields (like colors) are re-embedded
+    if st.button("🧨 Reset Vector DB (Rebuild)"):
+        shutil.rmtree("chroma_store", ignore_errors=True)
+        st.session_state.vector_db = None
+        st.session_state.vector_db_ready = False
+        st.toast("Vector DB deleted. Please click 'Load & Embed CSVs' again.")
+        st.rerun()
+
+    show_debug = st.checkbox("Show RAG Debug (retrieved context)", value=False)
+
 st.subheader("📁 Upload CSV Files")
 csv_files = st.file_uploader("Upload ODI product CSVs", type=["csv"], accept_multiple_files=True)
 
-# FIX (Issue #1/#2): make embedding button idempotent + show status
 if st.button("🔄 Load & Embed CSVs"):
     st.session_state.datasets = {}
     for f in csv_files:
         df = pd.read_csv(f)
+
+        # ✅ FIX: normalize column names to avoid 'colors ' / 'Colors' issues
+        df.columns = [c.strip() for c in df.columns]
+
         st.session_state.datasets[f.name] = df
 
-    # ensure persistent DB exists
     if st.session_state.vector_db is None:
         init_vector_db()
 
     add_to_vector_db()
     st.success("CSV files loaded. Vector index updated for RAG.")
 
-# Prompt settings
 with st.expander("🧠 Structured Prompt Controls", expanded=True):
     st.subheader("Prompt Settings")
     task = st.text_area("Task", value=DEFAULT_TASK)
@@ -390,7 +402,6 @@ with st.expander("🧠 Structured Prompt Controls", expanded=True):
     workflow = st.text_area("Workflow", value=DEFAULT_WORKFLOW)
     output_rules = st.text_area("Format Rules", value=DEFAULT_OUTPUT_RULES)
 
-# ---- Actions Row (LLM Setup / Clear / Export) ----
 st.subheader("Actions")
 a1, a2, a3 = st.columns(3)
 
@@ -428,7 +439,6 @@ with a3:
         use_container_width=True,
     )
 
-# Chat section
 st.subheader("💬 Chat")
 for m in st.session_state.chat:
     with st.chat_message(m["role"]):
@@ -442,7 +452,10 @@ if user_msg:
 
     context = rag_retrieve_context(user_msg)
 
-    # NOTE: your original code called build_system_prompt(); keep that name if you prefer.
+    if show_debug:
+        with st.expander("🔎 Retrieved RAG Context (Debug)", expanded=True):
+            st.text(context)
+
     sys_prompt = build_system_prompt(
         task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, context
     )
