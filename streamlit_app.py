@@ -209,12 +209,25 @@ If the user asks about a category not supported, explain the limitation and ask 
 Identify the riding category early (MTB vs BMX vs Moto vs Casual) because it strongly affects which grips fit.
 """
 
-DEFAULT_PREF_SCHEMA = """PREFERENCES:
-- riding_style: trail, enduro, downhill, cross-country, bmx, moto, urban, casual
-- locking_mechanism: lock-on, slip-on
-- thickness: thin, medium, thick, medium-thick size xl
-- damping_level: low, medium, high
-- durability: low, medium, high
+DEFAULT_PREF_SCHEMA = """PREFERENCES (ONLY THESE AFFECT RECOMMENDATIONS):
+
+Keys:
+- riding_style
+- locking_mechanism
+- thickness
+- damping_level
+- durability
+
+Allowed values:
+riding_style: trail, enduro, downhill, cross-country, bmx, moto, urban, casual
+locking_mechanism: lock-on, slip-on
+thickness: thin, medium, thick, medium-thick size xl
+damping_level: low, medium, high
+durability: low, medium, high
+
+Rules:
+- Only set a preference if the user clearly indicates it.
+- If unclear, leave it unset and ask ONE follow-up question.
 """
 
 DEFAULT_MAPPING = """MAPPING HINTS (use only when intent is clear): 
