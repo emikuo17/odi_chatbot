@@ -1,8 +1,7 @@
-# STREAMLIT APP with RAG EXTENSION (minimal fixes for color + rebuild)
+# STREAMLIT APP with RAG EXTENSION (minimal fixes for color + debug + NO persistent DB corruption)
 
 import json
 import time
-import shutil
 from typing import Dict, List
 
 import pandas as pd
@@ -37,8 +36,12 @@ def init_state():
 # RAG Functions
 # -----------------------
 def init_vector_db():
-    # Persistent client so embeddings survive reruns/restarts
-    client = chromadb.PersistentClient(path="chroma_store")
+    """
+    FIX: Use in-memory Chroma client to avoid Streamlit Cloud persistent DB corruption and
+    embedding-dimension mismatch issues that cause chromadb.errors.InternalError on .add().
+    Each time you upload/load, we rebuild cleanly.
+    """
+    client = chromadb.Client()  # ✅ in-memory
     st.session_state.vector_db = client.get_or_create_collection(name="odi-grips")
     st.session_state.vector_db_ready = True
 
@@ -119,9 +122,12 @@ def _row_to_product_card(row: pd.Series) -> str:
 
 
 def add_to_vector_db():
+    # Always ensure vector DB exists
     if st.session_state.vector_db is None:
         init_vector_db()
 
+    # Since we rebuild per upload, we don't need to "peek" for existing IDs.
+    # Keep your logic but it will usually be empty anyway.
     existing_ids = set()
     try:
         peek = st.session_state.vector_db.peek()
@@ -148,17 +154,23 @@ def add_to_vector_db():
             metadata.append({"source": fname, "row_index": int(i)})
 
     if not all_texts:
-        st.info("No new rows to embed (already embedded or empty).")
+        st.info("No rows to embed (empty dataset).")
         return
 
     embeddings = embed_texts(all_texts)
+
+    # Basic safety check (helps catch silent issues)
+    if not (len(all_texts) == len(ids) == len(metadata) == len(embeddings)):
+        st.error("Embedding batch length mismatch. Please check your CSV rows.")
+        return
+
     st.session_state.vector_db.add(
         documents=all_texts,
         embeddings=embeddings,
         ids=ids,
         metadatas=metadata,
     )
-    st.success(f"Embedded {len(all_texts)} new product rows.")
+    st.success(f"Embedded {len(all_texts)} product rows.")
 
 
 def rag_retrieve_context(query: str, top_k: int = 5) -> str:
@@ -361,20 +373,18 @@ with st.sidebar:
     api_key = st.text_input("OpenRouter API Key", type="password")
     model = st.text_input("Model", value="openai/gpt-4o-mini")
 
-    # ✅ CRITICAL: Reset Vector DB so updated fields (like colors) are re-embedded
-    if st.button("🧨 Reset Vector DB (Rebuild)"):
-        shutil.rmtree("chroma_store", ignore_errors=True)
-        st.session_state.vector_db = None
-        st.session_state.vector_db_ready = False
-        st.toast("Vector DB deleted. Please click 'Load & Embed CSVs' again.")
-        st.rerun()
-
+    # You want debug, keep it.
     show_debug = st.checkbox("Show RAG Debug (retrieved context)", value=False)
 
 st.subheader("📁 Upload CSV Files")
 csv_files = st.file_uploader("Upload ODI product CSVs", type=["csv"], accept_multiple_files=True)
 
 if st.button("🔄 Load & Embed CSVs"):
+    # ✅ FIX: rebuild vector DB each upload (no persistence, no reset needed)
+    st.session_state.vector_db = None
+    st.session_state.vector_db_ready = False
+    init_vector_db()
+
     st.session_state.datasets = {}
     for f in csv_files:
         df = pd.read_csv(f)
@@ -384,11 +394,15 @@ if st.button("🔄 Load & Embed CSVs"):
 
         st.session_state.datasets[f.name] = df
 
-    if st.session_state.vector_db is None:
-        init_vector_db()
-
     add_to_vector_db()
-    st.success("CSV files loaded. Vector index updated for RAG.")
+    st.success("CSV files loaded. Vector index rebuilt for RAG.")
+
+    # ✅ Debug: show columns in sidebar (what you asked for)
+    if show_debug and st.session_state.datasets:
+        st.sidebar.markdown("### ✅ Loaded CSV Columns")
+        for fname, df in st.session_state.datasets.items():
+            st.sidebar.write(fname)
+            st.sidebar.write(list(df.columns))
 
 with st.expander("🧠 Structured Prompt Controls", expanded=True):
     st.subheader("Prompt Settings")
