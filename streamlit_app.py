@@ -62,20 +62,21 @@ def _row_to_product_card(row: pd.Series) -> str:
 
     # Compact key fields if they exist in your schema
     preferred_keys = [
-        "category", "Category",
-        "riding_style", "Riding Style",
-        "locking_mechanism", "Locking Mechanism",
-        "thickness", "Thickness",
-        "damping_level", "Damping Level",
-        "durability", "Durability",
-        "pattern", "Pattern",
-        "compound", "Compound",
-        "material", "Material",
-        "weight", "Weight",
-        "color", "Color",
-        "description", "Description",
-        "notes", "Notes",
-        "url", "URL", "link", "Link",
+    "category", "Category",
+    "riding_style", "Riding Style",
+    "locking_mechanism", "Locking Mechanism",
+    "thickness", "Thickness",
+    "damping_level", "Damping Level",
+    "durability", "Durability",
+    "pattern", "Pattern",
+    "compound", "Compound",
+    "material", "Material",
+    "weight", "Weight",
+    "colors", "Colors",     
+    "color", "Color",        
+    "description", "Description",
+    "notes", "Notes",
+    "url", "URL", "link", "Link",
     ]
 
     lines = []
