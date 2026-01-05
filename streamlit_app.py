@@ -1,4 +1,4 @@
-# STREAMLIT APP with RAG EXTENSION (from your original base)
+# STREAMLIT APP with RAG EXTENSION (minimal fixes for issues 1–5)
 
 import json
 import time
@@ -10,7 +10,6 @@ import streamlit as st
 
 # RAG Libraries
 import chromadb
-from chromadb.utils import embedding_functions
 from sentence_transformers import SentenceTransformer
 
 # -----------------------
@@ -29,57 +28,187 @@ def init_state():
         st.session_state.vector_db = None
     if "embed_model" not in st.session_state:
         st.session_state.embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+    if "vector_db_ready" not in st.session_state:
+        st.session_state.vector_db_ready = False
 
 # -----------------------
 # RAG Functions
 # -----------------------
 def init_vector_db():
-    client = chromadb.Client()
-    st.session_state.vector_db = client.create_collection(name="odi-grips")
+    # FIX (Issue #2): Use persistent client so embeddings survive reruns/restarts
+    client = chromadb.PersistentClient(path="chroma_store")
+
+    # FIX (Issue #2): Use get_or_create_collection to avoid recreating each time
+    st.session_state.vector_db = client.get_or_create_collection(name="odi-grips")
+    st.session_state.vector_db_ready = True
+
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
     return st.session_state.embed_model.encode(texts).tolist()
 
+
+def _row_to_product_card(row: pd.Series) -> str:
+    """
+    FIX (Issue #5): Cleaner "product card" chunk formatting improves retrieval quality.
+    Uses whichever columns exist; avoids noisy "k: v, k: v" blobs.
+    """
+    # Try common name keys if present (doesn't break if missing)
+    name_key_candidates = ["product_name", "name", "title", "Product", "Product Name"]
+    prod_name = None
+    for k in name_key_candidates:
+        if k in row.index and pd.notna(row[k]):
+            prod_name = str(row[k]).strip()
+            break
+
+    # Compact key fields if they exist in your schema
+    preferred_keys = [
+        "category", "Category",
+        "riding_style", "Riding Style",
+        "locking_mechanism", "Locking Mechanism",
+        "thickness", "Thickness",
+        "damping_level", "Damping Level",
+        "durability", "Durability",
+        "pattern", "Pattern",
+        "compound", "Compound",
+        "material", "Material",
+        "weight", "Weight",
+        "color", "Color",
+        "description", "Description",
+        "notes", "Notes",
+        "url", "URL", "link", "Link",
+    ]
+
+    lines = []
+    if prod_name:
+        lines.append(f"Product: {prod_name}")
+
+    for k in preferred_keys:
+        if k in row.index and pd.notna(row[k]):
+            val = str(row[k]).strip()
+            if val:
+                # Normalize label to avoid duplicate label variants
+                label = str(k).replace("_", " ").title()
+                lines.append(f"{label}: {val}")
+
+    # Fallback: include a few remaining fields if we found nothing (avoid empty chunks)
+    if len(lines) <= 1:
+        extras = []
+        for k, v in row.items():
+            if pd.isna(v):
+                continue
+            if str(k) in preferred_keys:
+                continue
+            extras.append(f"{str(k)}: {str(v).strip()}")
+            if len(extras) >= 8:
+                break
+        if extras:
+            lines.append("Other:")
+            lines.extend(extras)
+
+    return "\n".join(lines).strip()
+
+
 def add_to_vector_db():
+    # Ensure vector DB exists
     if st.session_state.vector_db is None:
         init_vector_db()
+
+    # FIX (Issue #1): Use stable IDs to avoid duplicates/collisions
+    # FIX (Issue #1): Avoid re-embedding same IDs on repeated "Load & Embed"
+    existing_ids = set()
+    try:
+        # Chroma may not support listing all IDs in every config;
+        # we guard this to keep it compatible.
+        peek = st.session_state.vector_db.peek()
+        for _id in peek.get("ids", []):
+            existing_ids.add(_id)
+    except Exception:
+        pass
+
     all_texts, ids, metadata = [], [], []
-    idx = 0
+
     for fname, df in st.session_state.datasets.items():
-        for _, row in df.iterrows():
-            text = ", ".join([f"{k}: {v}" for k, v in row.items() if pd.notna(v)])
-            all_texts.append(text)
-            ids.append(f"chunk-{idx}")
-            metadata.append({"source": fname})
-            idx += 1
+        df = df.reset_index(drop=True)
+        for i, row in df.iterrows():
+            chunk_id = f"{fname}::row-{i}"  # stable
+            if chunk_id in existing_ids:
+                continue
+
+            card = _row_to_product_card(row)
+            if not card:
+                continue
+
+            all_texts.append(card)
+            ids.append(chunk_id)
+            metadata.append({"source": fname, "row_index": int(i)})
+
+    if not all_texts:
+        st.info("No new rows to embed (already embedded or empty).")
+        return
+
     embeddings = embed_texts(all_texts)
-    st.session_state.vector_db.add(documents=all_texts, embeddings=embeddings, ids=ids, metadatas=metadata)
+    st.session_state.vector_db.add(
+        documents=all_texts,
+        embeddings=embeddings,
+        ids=ids,
+        metadatas=metadata,
+    )
+    st.success(f"Embedded {len(all_texts)} new product rows.")
+
 
 def rag_retrieve_context(query: str, top_k: int = 5) -> str:
-    if st.session_state.vector_db is None:
-        return "No embedded product data available."
+    if st.session_state.vector_db is None or not st.session_state.vector_db_ready:
+        return "No embedded product data available. Please load and embed CSVs first."
+
     embedded_query = embed_texts([query])[0]
-    results = st.session_state.vector_db.query(query_embeddings=[embedded_query], n_results=top_k)
-    return "\n\n".join(results["documents"][0]) if results["documents"] else "No matching context."
+    results = st.session_state.vector_db.query(
+        query_embeddings=[embedded_query],
+        n_results=top_k,
+    )
+
+    docs = results.get("documents", [[]])
+    if not docs or not docs[0]:
+        return "No matching context."
+
+    # Present as clearly separated product cards
+    return "\n\n---\n\n".join(docs[0])
 
 # -----------------------
 # Defaults (Structured Prompts)
 # -----------------------
-DEFAULT_TASK = "You are an expert ODI grip specialist helping users of all levels—beginner to expert—choose the most suitable grip from ODI's product range based strictly on the uploaded CSV dataset. Your job is to recommend the best grip for their specific riding style, comfort needs, hand size, and skill level.""You are an ODI mountain bike grips expert who provides grip recommendations to users."
-DEFAULT_PERSONA = "The user may be a beginner or an experienced rider. Use simple, clear explanations for beginners (avoid technical jargon), and use more technical language if the user shows expertise or uses advanced terms. Always adapt based on how they describe their needs.""The user is an experienced mountain biker. Use technical terms and slang."
-DEFAULT_TONE = "Respond in a professional, supportive, and informative tone—similar to a knowledgeable customer service expert in a high-end bike shop. Encourage beginners and build trust with experienced riders.""Respond in a professional and informative tone, similar to a customer service representative."
+# FIX (Issue #3): remove accidental string concatenation duplicates
+DEFAULT_TASK = (
+    "You are an expert ODI grip specialist helping users of all levels—beginner to expert—"
+    "choose the most suitable grip from ODI's product range based strictly on the uploaded CSV dataset. "
+    "Your job is to recommend the best grip for their specific riding style, comfort needs, hand size, and skill level."
+)
+
+DEFAULT_PERSONA = (
+    "The user may be a beginner or an experienced rider. Use simple, clear explanations for beginners "
+    "(avoid technical jargon), and use more technical language if the user shows expertise or uses advanced terms. "
+    "Always adapt based on how they describe their needs."
+)
+
+DEFAULT_TONE = (
+    "Respond in a professional, supportive, and informative tone—similar to a knowledgeable customer service expert "
+    "in a high-end bike shop. Encourage beginners and build trust with experienced riders."
+)
+
 DEFAULT_DATA_RULES = """DATA RULES (STRICT):
 - Use ONLY information retrieved from the embedded ODI product dataset.
 - Do NOT browse the web, cite webpages, or use external reviews/knowledge.
 - Do NOT invent features, prices, specs, availability, or “best overall” claims.
 - If a detail is not in the retrieved context, say you’re not sure and ask a clarifying question instead.
 - Only ODI grips are allowed. Never recommend competitor brands.
+- Always recommend at least one specific product name from the retrieved context if a match is found.
 """
+
 DEFAULT_SCOPE = """SCOPE:
 This assistant supports ALL ODI grips in the dataset (e.g., MTB, BMX, Moto, Urban/Casual).
 If the user asks about a category not supported, explain the limitation and ask follow-up.
 Identify the riding category early (MTB vs BMX vs Moto vs Casual) because it strongly affects which grips fit.
 """
+
 DEFAULT_PREF_SCHEMA = """PREFERENCES:
 - riding_style: trail, enduro, downhill, cross-country, bmx, moto, urban, casual
 - locking_mechanism: lock-on, slip-on
@@ -87,6 +216,7 @@ DEFAULT_PREF_SCHEMA = """PREFERENCES:
 - damping_level: low, medium, high
 - durability: low, medium, high
 """
+
 DEFAULT_MAPPING = """MAPPING HINTS (use only when intent is clear): 
 riding_style: 
 - “BMX / park / street tricks” -> bmx 
@@ -96,18 +226,26 @@ riding_style:
 - “XC / racing / long climbs” -> cross-country 
 - “Moto” -> moto 
 - “Commuting / city rides” -> urban 
-- “Casual cruising / e-bike comfort” -> casual thickness: 
+- “Casual cruising / e-bike comfort” -> casual 
+
+thickness: 
 - “small hands / slim / skinny” -> thin 
 - “chunky / fat / big / extra padding” -> thick 
 - “large hands / XL gloves” -> medium-thick size xl (only if user indicates XL/very large hands) 
 
 damping_level: 
-- “hands numb / vibration / shock absorption / rocky” -> high - “balanced” -> medium 
-- “more trail feel / firm” -> low locking_mechanism: 
+- “hands numb / vibration / shock absorption / rocky” -> high 
+- “balanced” -> medium 
+- “more trail feel / firm” -> low 
+
+locking_mechanism: 
 - “lock-on / clamps” -> lock-on 
-- “slip-on / push-on” -> slip-on durability: 
+- “slip-on / push-on” -> slip-on 
+
+durability: 
 - “long-lasting / hard riding / abrasive trails” -> high
 """
+
 DEFAULT_WORKFLOW = """WORKFLOW:
 1) Welcome the user and ask what they ride + what problem they want to solve (comfort, control, numbness, hand size, etc.). 
 2) Identify riding_style early if possible. 
@@ -115,11 +253,12 @@ DEFAULT_WORKFLOW = """WORKFLOW:
 4) Once enough preferences are collected, recommend grips based ONLY on the dataset. 
 5) Briefly explain why the suggested grips match the stated preferences, without adding unsupported details.
 """
+
 DEFAULT_OUTPUT_RULES = """RESPONSE FORMAT:
 - Replies = 2–6 sentences
 - Include:
   (a) acknowledgment
-  (b) recommendation
+  (b) recommendation (include at least one named product when available)
   (c) one follow-up if needed
 - Avoid long lists or multiple follow-ups
 """
@@ -128,6 +267,7 @@ DEFAULT_OUTPUT_RULES = """RESPONSE FORMAT:
 # Prompt Assembly
 # -----------------------
 def build_system_prompt(task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, rag_context):
+    # FIX (Issue #4): Do not over-restrict when retrieval is empty; guide fallback behavior
     return f"""
 [Task Definition]
 {task}
@@ -160,8 +300,9 @@ def build_system_prompt(task, persona, tone, data_rules, scope, pref_schema, map
 {rag_context}
 
 IMPORTANT:
-- Only use above context. Never invent.
-- Ask follow-up if info is missing.
+- Use the RAG context above as your source of truth.
+- If the RAG context is empty or does not contain a named product that matches, say so and ask ONE clarifying question.
+- Do NOT invent. Do NOT use outside knowledge.
 """.strip()
 
 # -----------------------
@@ -182,8 +323,15 @@ def call_llm_openrouter(api_key: str, model: str, system_prompt: str, messages: 
         "X-Title": "ODI Grips Chatbot with RAG",
     }
     resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenRouter error {resp.status_code}: {resp.text}")
+
     data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    try:
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        raise RuntimeError(f"Unexpected response format: {json.dumps(data)[:1200]}")
 
 # -----------------------
 # Streamlit UI Start
@@ -200,13 +348,20 @@ with st.sidebar:
 
 st.subheader("📁 Upload CSV Files")
 csv_files = st.file_uploader("Upload ODI product CSVs", type=["csv"], accept_multiple_files=True)
+
+# FIX (Issue #1/#2): make embedding button idempotent + show status
 if st.button("🔄 Load & Embed CSVs"):
     st.session_state.datasets = {}
     for f in csv_files:
         df = pd.read_csv(f)
         st.session_state.datasets[f.name] = df
+
+    # ensure persistent DB exists
+    if st.session_state.vector_db is None:
+        init_vector_db()
+
     add_to_vector_db()
-    st.success("Files embedded for RAG.")
+    st.success("CSV files loaded. Vector index updated for RAG.")
 
 # Prompt settings
 with st.expander("🧠 Structured Prompt Controls", expanded=True):
@@ -272,7 +427,11 @@ if user_msg:
         st.markdown(user_msg)
 
     context = rag_retrieve_context(user_msg)
-    sys_prompt = build_system_prompt(task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, context)
+
+    # NOTE: your original code called build_system_prompt(); keep that name if you prefer.
+    sys_prompt = build_system_prompt(
+        task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, context
+    )
 
     with st.chat_message("assistant"):
         try:
