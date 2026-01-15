@@ -378,7 +378,10 @@ st.title("🚵 ODI Grips Chatbot (with RAG)")
 MODEL_PRESETS = {
     "GPT (OpenAI) — gpt-4o-mini": "openai/gpt-4o-mini",
     "Claude (Anthropic) — claude-3.5-sonnet": "anthropic/claude-3.5-sonnet",
-    "Gemini (Google) — gemini-pro-1.5": "google/gemini-pro-1.5",
+    # Google (Gemini) — USE FLASH, NOT PRO (more endpoints available)
+    "Gemini (Google) — Gemini 2.0 Flash": "google/gemini-2.0-flash-001",
+    # Backup Gemini (sometimes available, sometimes not)
+    "Gemini (Google) — Gemini 1.5 Flash": "google/gemini-1.5-flash",
 }
 
 with st.sidebar:
