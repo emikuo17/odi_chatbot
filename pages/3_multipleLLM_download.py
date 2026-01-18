@@ -587,15 +587,13 @@ if st.session_state.batch_df is not None:
     st.caption(f"Last run: {st.session_state.batch_last_run}")
     st.dataframe(st.session_state.batch_df, use_container_width=True)
 
-    # Download Excel
-    buf = io.BytesIO()
-    # Requires openpyxl installed
-    st.session_state.batch_df.to_excel(buf, index=False, engine="openpyxl")
+    # Download CSV (avoids openpyxl dependency/errors)
+    csv_bytes = st.session_state.batch_df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        "⬇️ Download Excel (.xlsx)",
-        data=buf.getvalue(),
-        file_name=f"pa6_batch_results_{time.strftime('%Y%m%d_%H%M%S')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "⬇️ Download CSV (.csv)",
+        data=csv_bytes,
+        file_name=f"pa6_batch_results_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
         use_container_width=True,
     )
 
