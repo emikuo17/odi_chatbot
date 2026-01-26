@@ -440,20 +440,24 @@ def run_batch_eval(
             task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, rag_context
         )
 
-        row = {
-            "conversation_id": idx,   # ✅ FIRST COLUMN requirement
-            "Question": q,
-            "RAG_Context": rag_context,  # keep for auditing / transparency
-        }
-
-        # 3) Call selected model(s)
         for label, model_id in model_items:
-            ans = safe_call_one(api_key, model_id, sys_prompt, q, temperature=temperature, max_tokens=max_tokens)
-            row[f"Answer — {label}"] = ans
-            done += 1
-            prog.progress(min(1.0, done / total_calls))
+    ans = safe_call_one(
+        api_key,
+        model_id,
+        sys_prompt,
+        q,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
 
-        rows.append(row)
+    rows.append({
+        "conversation_id": idx,
+        "question": q,
+        "model": model_id,
+        "answer": ans,
+        "rag_context": rag_context,   # optional but recommended
+    })
+
 
     df = pd.DataFrame(rows)
 
