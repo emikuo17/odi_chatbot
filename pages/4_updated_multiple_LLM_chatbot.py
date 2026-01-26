@@ -452,9 +452,11 @@ def run_batch_eval(
             rows.append({
                 "conversation_id": idx,
                 "question": q,
-                "model": model_id,
-                "answer": ans,
-                "rag_context": rag_context,  # optional but recommended
+                "llm": label,
+                "messages": [
+                    {"role": "user", "content": q},
+                    {"role": "assistant", "content": ans},
+                ],
             })
 
             done += 1
