@@ -4,6 +4,7 @@
 #    1) Batch results include FIRST column: conversation_id = 1,2,3,...
 #    2) After batch run: download BOTH CSV + JSON
 #    3) Batch runner: choose which LLM(s) to run (1, 2, or all 3)
+# ✅ UPDATE: LLM IDs changed to newer models on OpenRouter (GPT-4.1-mini, Claude Sonnet 4.5, Gemini 2.5 Flash)
 
 import io
 import json
@@ -383,10 +384,11 @@ def call_llm_openrouter(
 # -----------------------
 # PA6 Batch Runner Helpers (Selectable LLMs)
 # -----------------------
+# ✅ Updated to newer OpenRouter models
 BATCH_MODELS = {
-    "GPT (OpenAI) — gpt-4o-mini": "openai/gpt-4o-mini",
-    "Claude (Anthropic) — claude-3.5-sonnet": "anthropic/claude-3.5-sonnet",
-    "Gemini (Google) — Gemini 2.0 Flash": "google/gemini-2.0-flash-001",
+    "GPT (OpenAI) — GPT-4.1 Mini": "openai/gpt-4.1-mini",
+    "Claude (Anthropic) — Claude Sonnet 4.5": "anthropic/claude-sonnet-4.5",
+    "Gemini (Google) — Gemini 2.5 Flash": "google/gemini-2.5-flash",
 }
 
 
@@ -473,11 +475,12 @@ st.set_page_config(page_title="ODI Grips Chatbot (RAG)", page_icon="🚵", layou
 st.title("🚵 ODI Grips Chatbot (with RAG)")
 
 # ✅ Model presets for single-chat dropdown
+# ✅ Updated to newer OpenRouter models (plus one optional bigger GPT-4.1)
 MODEL_PRESETS = {
-    "GPT (OpenAI) — gpt-4o-mini": "openai/gpt-4o-mini",
-    "Claude (Anthropic) — claude-3.5-sonnet": "anthropic/claude-3.5-sonnet",
-    "Gemini (Google) — Gemini 2.0 Flash": "google/gemini-2.0-flash-001",
-    "Gemini (Google) — Gemini 1.5 Flash": "google/gemini-1.5-flash",
+    "GPT (OpenAI) — GPT-4.1 Mini": "openai/gpt-4.1-mini",
+    "GPT (OpenAI) — GPT-4.1 (larger)": "openai/gpt-4.1",
+    "Claude (Anthropic) — Claude Sonnet 4.5": "anthropic/claude-sonnet-4.5",
+    "Gemini (Google) — Gemini 2.5 Flash": "google/gemini-2.5-flash",
     "Custom (type your own model ID)": "__custom__",
 }
 
@@ -487,7 +490,7 @@ with st.sidebar:
 
     model_choice = st.selectbox("Choose LLM (Chat mode)", list(MODEL_PRESETS.keys()), index=0)
     if MODEL_PRESETS[model_choice] == "__custom__":
-        model = st.text_input("Model (OpenRouter ID)", value="openai/gpt-4o-mini")
+        model = st.text_input("Model (OpenRouter ID)", value="openai/gpt-4.1-mini")
     else:
         model = MODEL_PRESETS[model_choice]
         st.caption(f"Using model: `{model}`")
@@ -592,7 +595,7 @@ with colB:
     batch_max_tokens = st.number_input("Batch max_tokens", min_value=100, max_value=2000, value=600, step=50)
     include_context_col = st.checkbox("Include RAG_Context column in downloads", value=True)
 
-    # ✅ NEW: Choose which LLM(s) to run
+    # ✅ Choose which LLM(s) to run
     selected_labels = st.multiselect(
         "Choose LLM(s) to run in batch",
         options=list(BATCH_MODELS.keys()),
@@ -651,7 +654,7 @@ if st.session_state.batch_df is not None:
         use_container_width=True,
     )
 
-    # ✅ NEW: Download JSON
+    # Download JSON
     json_payload = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "row_count": int(len(st.session_state.batch_df)),
