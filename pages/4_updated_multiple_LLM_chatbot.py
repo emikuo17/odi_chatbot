@@ -544,7 +544,7 @@ with a1:
             try:
                 ping_system = "You are a helpful assistant. Reply exactly with 'LLM OK'."
                 ping_messages = [{"role": "user", "content": "LLM OK"}]
-                out = call_llm_openrouter(api_key, model, ping_system, ping_messages, temperature=0.0, max_tokens=10)
+                out = call_llm_openrouter(api_key, model, ping_system, ping_messages, temperature=0.0, max_tokens=50)
                 st.session_state.llm_confirmed = "LLM OK" in out
                 st.session_state.last_confirm_result = f"Response: {out}"
                 st.toast("LLM setup checked.")
