@@ -5,6 +5,8 @@
 #    2) After batch run: download BOTH CSV + JSON
 #    3) Batch runner: choose which LLM(s) to run (1, 2, or all 3)
 # ✅ UPDATE: LLM IDs changed to newer models on OpenRouter (GPT-4.1-mini, Claude Sonnet 4.5, Gemini 2.5 Flash)
+# ✅ UPDATE: Batch output changed to LONG format:
+#    {conversation_id, question, model, answer, rag_context}
 
 import io
 import json
@@ -401,7 +403,6 @@ def safe_call_one(
     max_tokens: int = 600,
 ) -> str:
     try:
-        # IMPORTANT: isolate each question (no multi-question chat memory) for fair eval
         msgs = [{"role": "user", "content": question}]
         return call_llm_openrouter(api_key, model_id, sys_prompt, msgs, temperature=temperature, max_tokens=max_tokens)
     except Exception as e:
@@ -432,40 +433,38 @@ def run_batch_eval(
     prog = st.progress(0)
 
     for idx, q in enumerate(questions, start=1):
-        # 1) RAG retrieve ONCE per question (fair across models)
         rag_context = rag_retrieve_context(q, top_k=top_k)
-
-        # 2) Build ONE system prompt using the same context
         sys_prompt = build_system_prompt(
             task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, rag_context
         )
 
+        # ✅ LONG format: one row per (question, model)
         for label, model_id in model_items:
-    ans = safe_call_one(
-        api_key,
-        model_id,
-        sys_prompt,
-        q,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+            ans = safe_call_one(
+                api_key=api_key,
+                model_id=model_id,
+                sys_prompt=sys_prompt,
+                question=q,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
 
-    rows.append({
-        "conversation_id": idx,
-        "question": q,
-        "model": model_id,
-        "answer": ans,
-        "rag_context": rag_context,   # optional but recommended
-    })
+            rows.append({
+                "conversation_id": idx,
+                "question": q,
+                "model": model_id,
+                "answer": ans,
+                "rag_context": rag_context,  # optional but recommended
+            })
 
+            done += 1
+            prog.progress(min(1.0, done / total_calls))
 
     df = pd.DataFrame(rows)
 
-    # Ensure conversation_id is the first column even if pandas reorders
-    cols = list(df.columns)
-    if "conversation_id" in cols:
-        cols = ["conversation_id"] + [c for c in cols if c != "conversation_id"]
-        df = df[cols]
+    # Ensure conversation_id is first column
+    if not df.empty and "conversation_id" in df.columns:
+        df = df[["conversation_id"] + [c for c in df.columns if c != "conversation_id"]]
 
     return df
 
@@ -478,8 +477,6 @@ init_state()
 st.set_page_config(page_title="ODI Grips Chatbot (RAG)", page_icon="🚵", layout="wide")
 st.title("🚵 ODI Grips Chatbot (with RAG)")
 
-# ✅ Model presets for single-chat dropdown
-# ✅ Updated to newer OpenRouter models (plus one optional bigger GPT-4.1)
 MODEL_PRESETS = {
     "GPT (OpenAI) — GPT-4.1 Mini": "openai/gpt-4.1-mini",
     "GPT (OpenAI) — GPT-4.1 (larger)": "openai/gpt-4.1",
@@ -597,9 +594,8 @@ with colB:
     top_k = st.number_input("RAG top_k", min_value=1, max_value=15, value=5, step=1)
     batch_temp = st.slider("Batch temperature", min_value=0.0, max_value=1.0, value=0.2, step=0.05)
     batch_max_tokens = st.number_input("Batch max_tokens", min_value=100, max_value=2000, value=600, step=50)
-    include_context_col = st.checkbox("Include RAG_Context column in downloads", value=True)
+    include_context_col = st.checkbox("Include rag_context column in downloads", value=True)
 
-    # ✅ Choose which LLM(s) to run
     selected_labels = st.multiselect(
         "Choose LLM(s) to run in batch",
         options=list(BATCH_MODELS.keys()),
@@ -631,13 +627,12 @@ if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
                 max_tokens=int(batch_max_tokens),
             )
 
-        if not include_context_col and "RAG_Context" in df.columns:
-            df = df.drop(columns=["RAG_Context"])
+        if not include_context_col and "rag_context" in df.columns:
+            df = df.drop(columns=["rag_context"])
 
-        # Ensure conversation_id is still first after optional drop
-        cols = list(df.columns)
-        if "conversation_id" in cols:
-            df = df[["conversation_id"] + [c for c in cols if c != "conversation_id"]]
+        # Ensure conversation_id is still first
+        if not df.empty and "conversation_id" in df.columns:
+            df = df[["conversation_id"] + [c for c in df.columns if c != "conversation_id"]]
 
         st.session_state.batch_df = df
         st.session_state.batch_last_run = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -648,7 +643,6 @@ if st.session_state.batch_df is not None:
     st.caption(f"Last run: {st.session_state.batch_last_run}")
     st.dataframe(st.session_state.batch_df, use_container_width=True)
 
-    # Download CSV
     csv_bytes = st.session_state.batch_df.to_csv(index=False).encode("utf-8")
     st.download_button(
         "⬇️ Download CSV (.csv)",
@@ -658,7 +652,6 @@ if st.session_state.batch_df is not None:
         use_container_width=True,
     )
 
-    # Download JSON
     json_payload = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "row_count": int(len(st.session_state.batch_df)),
