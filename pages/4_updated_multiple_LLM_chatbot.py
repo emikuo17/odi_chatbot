@@ -451,7 +451,6 @@ def run_batch_eval(
 
             rows.append({
                 "conversation_id": idx,
-                "question": q,
                 "model_id": model_id,
                 "messages": [
                     {"role": "user", "content": q},
