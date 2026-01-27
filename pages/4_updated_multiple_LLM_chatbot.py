@@ -5,8 +5,13 @@
 #    2) After batch run: download BOTH CSV + JSON
 #    3) Batch runner: choose which LLM(s) to run (1, 2, or all 3)
 # ✅ UPDATE: LLM IDs changed to newer models on OpenRouter (GPT-4.1-mini, Claude Sonnet 4.5, Gemini 2.5 Flash)
-# ✅ UPDATE: Batch output changed to LONG format:
-#    {conversation_id, question, model, answer, rag_context}
+
+# ✅ YOUR REQUESTED CHANGES (ONLY):
+# 1) Remove JSON wrapper layer: generated_at / row_count / data
+#    -> JSON output becomes a plain list: [ {...}, {...} ]
+# 2) Change JSON output key from "model_id" -> "model"
+#    -> internal calling still uses model_id variable; only the OUTPUT key is renamed
+# Everything else remains the same.
 
 import io
 import json
@@ -449,9 +454,10 @@ def run_batch_eval(
                 max_tokens=max_tokens,
             )
 
+            # ✅ ONLY CHANGE: output key "model" (not model_id)
             rows.append({
                 "conversation_id": idx,
-                "model_id": model_id,
+                "model": model_id,
                 "messages": [
                     {"role": "user", "content": q},
                     {"role": "assistant", "content": ans},
@@ -653,12 +659,14 @@ if st.session_state.batch_df is not None:
         use_container_width=True,
     )
 
-    json_payload = {
-        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "row_count": int(len(st.session_state.batch_df)),
-        "data": st.session_state.batch_df.to_dict(orient="records"),
-    }
-    json_bytes = json.dumps(json_payload, indent=2, ensure_ascii=False).encode("utf-8")
+    # ✅ CHANGE 1: remove wrapper generated_at/row_count/data
+    # ✅ CHANGE 2: keep JSON as plain list records
+    json_bytes = json.dumps(
+        st.session_state.batch_df.to_dict(orient="records"),
+        indent=2,
+        ensure_ascii=False
+    ).encode("utf-8")
+
     st.download_button(
         "⬇️ Download JSON (.json)",
         data=json_bytes,
