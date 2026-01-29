@@ -1,17 +1,14 @@
-# STREAMLIT APP with RAG + PA6 Batch Runner + ✅ PA7 Conversation Simulator (Customer Bot)
+# STREAMLIT APP with RAG + Batch Runner + ✅ Conversation Simulator (Customer Bot)
 # ✅ Keeps your original RAG pipeline + structured prompt controls + chat UI
-# ✅ Keeps PA6 batch runner output (LONG format)
-# ✅ Adds PA7 simulation: Customer Bot generates 1 follow-up turn (optional) and logs full transcript
+# ✅ Keeps batch runner output (LONG format)
+# ✅ Adds simulation: Customer Bot generates 1 follow-up turn (optional) and logs full transcript
 #
-# WHAT CHANGED (summary) — MINIMAL UI-ONLY ADJUSTMENTS:
-# 1) ✅ Layout change: Top/Global keeps ONLY "Confirm LLM Setup"
-#    -> "Clear Chat History" + "Download Transcript" moved to Chat section
-# 2) ✅ Customer Bot System Prompt moved OUT of Structured Prompt Controls
-#    -> Now inside PA7 section under expander: "Advanced: Customer Bot Prompt"
-# 3) ✅ Rename PA7 label from "Conversation Simulation" to "Simulation Bot"
-# 4) ✅ Sidebar label changed: “Choose LLM (Chat mode)” -> “Chat LLM (Single Chat Mode)”
+# WHAT CHANGED (summary) — MINIMAL UI + TRANSCRIPT FORMAT ADJUSTMENTS:
+# 1) ✅ Removed "PA6" / "PA7" text from UI + comments (kept the same features)
+# 2) ✅ Single Chat "Download Transcript" JSON now matches the batch-style output:
+#    -> list of records with {conversation_id, model, messages}
 #
-# No new features added. No logic changes to RAG / PA6 / PA7 runners.
+# No new features added. No logic changes to RAG / batch / simulation runners.
 
 import io
 import json
@@ -53,13 +50,13 @@ def init_state():
     if "vector_db_ready" not in st.session_state:
         st.session_state.vector_db_ready = False
 
-    # ✅ PA6 batch results
+    # ✅ batch results
     if "batch_df" not in st.session_state:
         st.session_state.batch_df = None
     if "batch_last_run" not in st.session_state:
         st.session_state.batch_last_run = ""
 
-    # ✅ PA7 simulation results
+    # ✅ simulation results
     if "sim_df" not in st.session_state:
         st.session_state.sim_df = None
     if "sim_last_run" not in st.session_state:
@@ -363,7 +360,7 @@ IMPORTANT:
 
 
 # -----------------------
-# ✅ PA7 Customer Bot (Simulator)
+# ✅ Customer Bot (Simulator)
 # -----------------------
 DEFAULT_CUSTOMER_BOT_SYSTEM = """You are simulating a real customer asking about bicycle grips.
 Goal: continue a short, realistic conversation based on the assistant's previous reply.
@@ -424,7 +421,7 @@ def call_llm_openrouter(
 
 
 # -----------------------
-# PA6 Batch Runner Helpers (Selectable LLMs)
+# Batch Runner Helpers (Selectable LLMs)
 # -----------------------
 BATCH_MODELS = {
     "GPT (OpenAI) — GPT-4.1 Mini": "openai/gpt-4.1-mini",
@@ -508,7 +505,7 @@ def run_batch_eval(
 
 
 # -----------------------
-# ✅ PA7 Conversation Simulation Runner
+# ✅ Conversation Simulation Runner
 # -----------------------
 def safe_customer_followup(
     api_key: str,
@@ -669,7 +666,6 @@ with st.sidebar:
     st.header("LLM Settings")
     api_key = st.text_input("OpenRouter API Key", type="password")
 
-    # (4) ✅ label change only
     model_choice = st.selectbox("Chat LLM (Single Chat Mode)", list(MODEL_PRESETS.keys()), index=0)
     if MODEL_PRESETS[model_choice] == "__custom__":
         model = st.text_input("Model (OpenRouter ID)", value="openai/gpt-4.1-mini")
@@ -714,7 +710,6 @@ with st.expander("🧠 Structured Prompt Controls", expanded=True):
     workflow = st.text_area("Workflow", value=DEFAULT_WORKFLOW)
     output_rules = st.text_area("Format Rules", value=DEFAULT_OUTPUT_RULES)
 
-# (1) ✅ Top/Global: confirm only
 st.subheader("Actions")
 a1 = st.columns(1)[0]
 with a1:
@@ -738,10 +733,10 @@ if st.session_state.last_confirm_result:
     st.info(st.session_state.last_confirm_result)
 
 # -----------------------
-# ✅ PA6 Batch Evaluation Section
+# Batch Evaluation Section
 # -----------------------
 st.divider()
-st.header("📊 PA6 Batch Evaluation (Run Questions × Selectable LLMs)")
+st.header("📊 Batch Evaluation (Run Questions × Selectable LLMs)")
 
 colA, colB = st.columns([2, 1])
 with colA:
@@ -806,7 +801,7 @@ if st.session_state.batch_df is not None:
     st.download_button(
         "⬇️ Download CSV (.csv)",
         data=csv_bytes,
-        file_name=f"pa6_batch_results_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+        file_name=f"batch_results_{time.strftime('%Y%m%d_%H%M%S')}.csv",
         mime="text/csv",
         use_container_width=True,
     )
@@ -820,17 +815,16 @@ if st.session_state.batch_df is not None:
     st.download_button(
         "⬇️ Download JSON (.json)",
         data=json_bytes,
-        file_name=f"pa6_batch_results_{time.strftime('%Y%m%d_%H%M%S')}.json",
+        file_name=f"batch_results_{time.strftime('%Y%m%d_%H%M%S')}.json",
         mime="application/json",
         use_container_width=True,
     )
 
 # -----------------------
-# ✅ PA7 Simulation Bot Section (Customer Bot)
+# Simulation Bot Section (Customer Bot)
 # -----------------------
 st.divider()
-# (3) ✅ rename label only
-st.header("🧪 PA7 Simulation Bot (Customer Bot)")
+st.header("🧪 Simulation Bot (Customer Bot)")
 
 sim_left, sim_right = st.columns([2, 1])
 with sim_left:
@@ -844,7 +838,6 @@ with sim_right:
     st.caption("Simulation Settings")
     sim_enable_followup = st.checkbox("Enable 1 customer follow-up turn", value=True)
 
-    # Which assistant models to test (can reuse same selection list)
     sim_selected_labels = st.multiselect(
         "Assistant LLM(s) for simulation",
         options=list(BATCH_MODELS.keys()),
@@ -853,7 +846,6 @@ with sim_right:
     )
     sim_assistant_models = {label: BATCH_MODELS[label] for label in sim_selected_labels}
 
-    # Customer simulator model
     customer_choice = st.selectbox(
         "Customer Bot LLM",
         options=list(MODEL_PRESETS.keys()),
@@ -873,7 +865,6 @@ with sim_right:
 
     sim_include_context_cols = st.checkbox("Include rag_context columns in downloads", value=True, key="sim_include_ctx")
 
-# (2) ✅ customer prompt moved here (still same variable name customer_system)
 with st.expander("Advanced: Customer Bot Prompt", expanded=False):
     customer_system = st.text_area("Customer Bot System Prompt", value=DEFAULT_CUSTOMER_BOT_SYSTEM, height=200)
 
@@ -917,7 +908,7 @@ if st.button("🧪 Run Conversation Simulation", disabled=sim_run_disabled, use_
         st.success(f"Simulation finished at {st.session_state.sim_last_run}. Rows: {len(sim_df)}")
 
 if st.session_state.sim_df is not None:
-    st.subheader("✅ Simulation Results (PA7)")
+    st.subheader("✅ Simulation Results")
     st.caption(f"Last run: {st.session_state.sim_last_run}")
     st.dataframe(st.session_state.sim_df, use_container_width=True)
 
@@ -925,7 +916,7 @@ if st.session_state.sim_df is not None:
     st.download_button(
         "⬇️ Download Simulation CSV (.csv)",
         data=sim_csv_bytes,
-        file_name=f"pa7_simulation_results_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+        file_name=f"simulation_results_{time.strftime('%Y%m%d_%H%M%S')}.csv",
         mime="text/csv",
         use_container_width=True,
     )
@@ -939,7 +930,7 @@ if st.session_state.sim_df is not None:
     st.download_button(
         "⬇️ Download Simulation JSON (.json)",
         data=sim_json_bytes,
-        file_name=f"pa7_simulation_results_{time.strftime('%Y%m%d_%H%M%S')}.json",
+        file_name=f"simulation_results_{time.strftime('%Y%m%d_%H%M%S')}.json",
         mime="application/json",
         use_container_width=True,
     )
@@ -950,7 +941,6 @@ if st.session_state.sim_df is not None:
 st.divider()
 st.header("💬 Chat (Single LLM)")
 
-# (1) ✅ Chat section actions moved here
 chat_a1, chat_a2 = st.columns(2)
 with chat_a1:
     if st.button("🧹 Clear Chat History", use_container_width=True):
@@ -960,7 +950,13 @@ with chat_a1:
 with chat_a2:
     def transcript_json():
         return json.dumps(
-            {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "messages": st.session_state.chat},
+            [
+                {
+                    "conversation_id": 1,
+                    "model": model,
+                    "messages": st.session_state.chat,
+                }
+            ],
             indent=2,
             ensure_ascii=False,
         )
@@ -968,7 +964,7 @@ with chat_a2:
     st.download_button(
         "⬇️ Download Transcript",
         data=transcript_json().encode("utf-8"),
-        file_name="odi_chat_transcript.json",
+        file_name="chat_transcript.json",
         mime="application/json",
         use_container_width=True,
     )
