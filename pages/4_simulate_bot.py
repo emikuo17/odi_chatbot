@@ -3,12 +3,15 @@
 # ✅ Keeps PA6 batch runner output (LONG format)
 # ✅ Adds PA7 simulation: Customer Bot generates 1 follow-up turn (optional) and logs full transcript
 #
-# WHAT CHANGED (summary):
-# 1) ✅ Added Customer Bot system prompt + function to generate a follow-up question
-# 2) ✅ Added a new PA7 UI section: "PA7 Conversation Simulation (Customer Bot)"
-# 3) ✅ Added new runner: run_conversation_simulation() that produces multi-turn transcripts
-# 4) ✅ Added state vars: sim_df, sim_last_run
-# 5) ✅ No judge bot included (per your request)
+# WHAT CHANGED (summary) — MINIMAL UI-ONLY ADJUSTMENTS:
+# 1) ✅ Layout change: Top/Global keeps ONLY "Confirm LLM Setup"
+#    -> "Clear Chat History" + "Download Transcript" moved to Chat section
+# 2) ✅ Customer Bot System Prompt moved OUT of Structured Prompt Controls
+#    -> Now inside PA7 section under expander: "Advanced: Customer Bot Prompt"
+# 3) ✅ Rename PA7 label from "Conversation Simulation" to "Simulation Bot"
+# 4) ✅ Sidebar label changed: “Choose LLM (Chat mode)” -> “Chat LLM (Single Chat Mode)”
+#
+# No new features added. No logic changes to RAG / PA6 / PA7 runners.
 
 import io
 import json
@@ -666,7 +669,8 @@ with st.sidebar:
     st.header("LLM Settings")
     api_key = st.text_input("OpenRouter API Key", type="password")
 
-    model_choice = st.selectbox("Choose LLM (Chat mode)", list(MODEL_PRESETS.keys()), index=0)
+    # (4) ✅ label change only
+    model_choice = st.selectbox("Chat LLM (Single Chat Mode)", list(MODEL_PRESETS.keys()), index=0)
     if MODEL_PRESETS[model_choice] == "__custom__":
         model = st.text_input("Model (OpenRouter ID)", value="openai/gpt-4.1-mini")
     else:
@@ -710,12 +714,9 @@ with st.expander("🧠 Structured Prompt Controls", expanded=True):
     workflow = st.text_area("Workflow", value=DEFAULT_WORKFLOW)
     output_rules = st.text_area("Format Rules", value=DEFAULT_OUTPUT_RULES)
 
-    st.subheader("PA7 Customer Bot Prompt (Simulator)")
-    customer_system = st.text_area("Customer Bot System Prompt", value=DEFAULT_CUSTOMER_BOT_SYSTEM, height=200)
-
+# (1) ✅ Top/Global: confirm only
 st.subheader("Actions")
-a1, a2, a3 = st.columns(3)
-
+a1 = st.columns(1)[0]
 with a1:
     if st.button("✅ Confirm LLM Setup", use_container_width=True):
         if not api_key:
@@ -732,27 +733,6 @@ with a1:
             except Exception as e:
                 st.session_state.llm_confirmed = False
                 st.session_state.last_confirm_result = f"Error: {e}"
-
-with a2:
-    if st.button("🧹 Clear Chat History", use_container_width=True):
-        st.session_state.chat = []
-        st.toast("Chat history cleared.")
-
-with a3:
-    def transcript_json():
-        return json.dumps(
-            {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "messages": st.session_state.chat},
-            indent=2,
-            ensure_ascii=False,
-        )
-
-    st.download_button(
-        "⬇️ Download Transcript",
-        data=transcript_json().encode("utf-8"),
-        file_name="odi_chat_transcript.json",
-        mime="application/json",
-        use_container_width=True,
-    )
 
 if st.session_state.last_confirm_result:
     st.info(st.session_state.last_confirm_result)
@@ -846,10 +826,11 @@ if st.session_state.batch_df is not None:
     )
 
 # -----------------------
-# ✅ PA7 Conversation Simulation Section (Customer Bot)
+# ✅ PA7 Simulation Bot Section (Customer Bot)
 # -----------------------
 st.divider()
-st.header("🧪 PA7 Conversation Simulation (Customer Bot)")
+# (3) ✅ rename label only
+st.header("🧪 PA7 Simulation Bot (Customer Bot)")
 
 sim_left, sim_right = st.columns([2, 1])
 with sim_left:
@@ -891,6 +872,10 @@ with sim_right:
     sim_customer_max_tokens = st.number_input("Customer max_tokens", 60, 400, 120, 10, key="sim_customer_max_tokens")
 
     sim_include_context_cols = st.checkbox("Include rag_context columns in downloads", value=True, key="sim_include_ctx")
+
+# (2) ✅ customer prompt moved here (still same variable name customer_system)
+with st.expander("Advanced: Customer Bot Prompt", expanded=False):
+    customer_system = st.text_area("Customer Bot System Prompt", value=DEFAULT_CUSTOMER_BOT_SYSTEM, height=200)
 
 sim_seed_questions = [q.strip() for q in sim_questions_text.splitlines() if q.strip()]
 
@@ -960,10 +945,33 @@ if st.session_state.sim_df is not None:
     )
 
 # -----------------------
-# Chat UI (unchanged)
+# Chat UI
 # -----------------------
 st.divider()
 st.header("💬 Chat (Single LLM)")
+
+# (1) ✅ Chat section actions moved here
+chat_a1, chat_a2 = st.columns(2)
+with chat_a1:
+    if st.button("🧹 Clear Chat History", use_container_width=True):
+        st.session_state.chat = []
+        st.toast("Chat history cleared.")
+
+with chat_a2:
+    def transcript_json():
+        return json.dumps(
+            {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "messages": st.session_state.chat},
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    st.download_button(
+        "⬇️ Download Transcript",
+        data=transcript_json().encode("utf-8"),
+        file_name="odi_chat_transcript.json",
+        mime="application/json",
+        use_container_width=True,
+    )
 
 for m in st.session_state.chat:
     with st.chat_message(m["role"]):
