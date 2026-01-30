@@ -62,6 +62,10 @@ def init_state():
     if "sim_last_run" not in st.session_state:
         st.session_state.sim_last_run = ""
 
+    # ✅ persist load/embed status messages across reruns
+    if "embed_status_lines" not in st.session_state:
+        st.session_state.embed_status_lines = []
+
 
 # -----------------------
 # RAG Functions
@@ -675,6 +679,13 @@ with st.sidebar:
 
     show_debug = st.checkbox("Show RAG Debug (retrieved context)", value=False)
 
+# ✅ Sidebar debug: always show loaded columns if debug is on (moved outside button handler)
+if show_debug and st.session_state.datasets:
+    st.sidebar.markdown("### ✅ Loaded CSV Columns")
+    for fname, df in st.session_state.datasets.items():
+        st.sidebar.write(fname)
+        st.sidebar.write(list(df.columns))
+
 st.subheader("📁 Upload CSV Files")
 csv_files = st.file_uploader("Upload ODI product CSVs", type=["csv"], accept_multiple_files=True)
 
@@ -689,11 +700,15 @@ if st.button("🔄 Load & Embed CSVs"):
         df.columns = [c.strip() for c in df.columns]
         st.session_state.datasets[f.name] = df
 
-    add_to_vector_db()
-    st.success("CSV files loaded. Vector index rebuilt for RAG.")
+    # ✅ reset persisted status messages for this run
+    st.session_state.embed_status_lines = []
 
-    # ✅ Keyword sanity check (BEFORE embeddings)
-    # Checks whether Vanquish exists in loaded CSV text
+    add_to_vector_db()
+
+    # persist load/embed status so it doesn't disappear after other button clicks
+    st.session_state.embed_status_lines.append("✅ CSV files loaded. Vector index rebuilt for RAG.")
+
+    # ✅ Keyword sanity check (kept in same location to avoid other changes)
     target_full = "vanquish lock-on grips"
     target_short = "vanquish"
 
@@ -704,17 +719,23 @@ if st.button("🔄 Load & Embed CSVs"):
     combined_text_lc = combined_text.lower()
 
     if (target_full not in combined_text_lc) and (target_short not in combined_text_lc):
-        st.error("❌ Sanity Check Failed: 'Vanquish Lock-On Grips' (or 'Vanquish') not found in loaded CSVs BEFORE embeddings.")
+        msg = "❌ Sanity Check Failed: 'Vanquish Lock-On Grips' (or 'Vanquish') not found in loaded CSVs BEFORE embeddings."
+        st.session_state.embed_status_lines.append(msg)
+        st.error(msg)
         st.stop()
     else:
-        st.success("✅ Sanity Check Passed: Vanquish found in loaded CSVs (pre-embedding).")
+        st.session_state.embed_status_lines.append("✅ Sanity Check Passed: Vanquish found in loaded CSVs (pre-embedding).")
 
+    st.success("CSV files loaded. Vector index rebuilt for RAG.")
+    st.success("✅ Sanity Check Passed: Vanquish found in loaded CSVs (pre-embedding).")
 
-    if show_debug and st.session_state.datasets:
-        st.sidebar.markdown("### ✅ Loaded CSV Columns")
-        for fname, df in st.session_state.datasets.items():
-            st.sidebar.write(fname)
-            st.sidebar.write(list(df.columns))
+# ✅ Show persisted embed/load messages (survive reruns)
+if st.session_state.get("embed_status_lines"):
+    for line in st.session_state.embed_status_lines:
+        if line.startswith("❌"):
+            st.error(line)
+        else:
+            st.success(line)
 
 with st.expander("🧠 Structured Prompt Controls", expanded=True):
     st.subheader("Prompt Settings")
