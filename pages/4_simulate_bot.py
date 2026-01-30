@@ -782,7 +782,7 @@ with colA:
         placeholder="Question 1...\nQuestion 2...\n..."
     )
 with colB:
-    top_k = st.number_input("RAG top_k", min_value=1, max_value=15, value=5, step=1)
+    top_k = st.number_input("RAG top_k", min_value=1, max_value=15, value=15, step=1)
     batch_temp = st.slider("Batch temperature", min_value=0.0, max_value=1.0, value=0.2, step=0.05)
     batch_max_tokens = st.number_input("Batch max_tokens", min_value=100, max_value=2000, value=600, step=50)
     include_context_col = st.checkbox("Include rag_context column in downloads", value=True)
@@ -1015,6 +1015,7 @@ if user_msg:
     with st.chat_message("user"):
         st.markdown(user_msg)
 
+    st.caption(f"Single Chat RAG top_k = {int(top_k)}")
     context = rag_retrieve_context(user_msg, top_k=int(top_k))
 
     if show_debug:
