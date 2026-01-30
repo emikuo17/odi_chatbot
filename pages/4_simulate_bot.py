@@ -726,9 +726,6 @@ if st.button("🔄 Load & Embed CSVs"):
     else:
         st.session_state.embed_status_lines.append("✅ Sanity Check Passed: Vanquish found in loaded CSVs (pre-embedding).")
 
-    st.success("CSV files loaded. Vector index rebuilt for RAG.")
-    st.success("✅ Sanity Check Passed: Vanquish found in loaded CSVs (pre-embedding).")
-
 # ✅ Show persisted embed/load messages (survive reruns)
 if st.session_state.get("embed_status_lines"):
     for line in st.session_state.embed_status_lines:
