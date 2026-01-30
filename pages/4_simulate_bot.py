@@ -692,6 +692,24 @@ if st.button("🔄 Load & Embed CSVs"):
     add_to_vector_db()
     st.success("CSV files loaded. Vector index rebuilt for RAG.")
 
+    # ✅ Keyword sanity check (BEFORE embeddings)
+    # Checks whether Vanquish exists in loaded CSV text
+    target_full = "vanquish lock-on grips"
+    target_short = "vanquish"
+
+    combined_text = ""
+    for _fname, _df in st.session_state.datasets.items():
+        combined_text += " " + " ".join(_df.astype(str).fillna("").values.flatten())
+
+    combined_text_lc = combined_text.lower()
+
+    if (target_full not in combined_text_lc) and (target_short not in combined_text_lc):
+        st.error("❌ Sanity Check Failed: 'Vanquish Lock-On Grips' (or 'Vanquish') not found in loaded CSVs BEFORE embeddings.")
+        st.stop()
+    else:
+        st.success("✅ Sanity Check Passed: Vanquish found in loaded CSVs (pre-embedding).")
+
+
     if show_debug and st.session_state.datasets:
         st.sidebar.markdown("### ✅ Loaded CSV Columns")
         for fname, df in st.session_state.datasets.items():
