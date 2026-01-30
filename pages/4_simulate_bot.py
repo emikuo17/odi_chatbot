@@ -1015,7 +1015,7 @@ if user_msg:
     with st.chat_message("user"):
         st.markdown(user_msg)
 
-    context = rag_retrieve_context(user_msg)
+    context = rag_retrieve_context(user_msg, top_k=int(top_k))
 
     if show_debug:
         with st.expander("🔎 Retrieved RAG Context (Debug)", expanded=True):
