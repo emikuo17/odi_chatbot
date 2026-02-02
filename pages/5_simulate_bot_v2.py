@@ -99,26 +99,19 @@ def _row_to_product_card(row: pd.Series) -> str:
             break
 
     preferred_keys = [
-    "name", "Name",
+    "product_name", "Product Name",
     "category", "Category",
     "riding_style", "Riding Style",
-    "Grip Attachment System",
-    "locking_mechanism", "Locking Mechanism",
-    "length", "Length",
-    "thickness", "Thickness",
-    "damping_level", "Damping Level",
-    "durability", "Durability",
-    "grip_pattern", "Grip Pattern",
-    "ergonomics",
-    "feel", "Feel",
-    "traction", "Traction",
-    "price", "Price",
-    "key_features", "Key Features",
-    "differentiator", "Differentiator",
-    "co_branding", "Co Branding",
+    "length_mm", "Length (mm)",
+    "diameter_mm", "Diameter (mm)",
+    "thickness_category", "Thickness Category",
     "colors", "Colors",
+    "locking_mechanism", "Locking Mechanism",
+    "damping_level", "Damping Level",
+    "vibration_reduction", "Vibration Reduction",
+    "grip_pattern", "Grip Pattern",
+    "price", "Price"
     ]
-
 
     lines = []
     if prod_name:
