@@ -648,20 +648,19 @@ if st.button("🔄 Load & Embed CSVs"):
 
     st.session_state.datasets = {}
     for f in csv_files:
-    df = pd.read_csv(
-        f,
-        dtype=str,
-        engine="python",
-        keep_default_na=False
-    )
-    df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
-    df = df.fillna("")
-    st.session_state.datasets[f.name] = df
+        df = pd.read_csv(
+            f,
+            dtype=str,
+            engine="python",
+            keep_default_na=False
+        )
+        df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
+        df = df.fillna("")
+        st.session_state.datasets[f.name] = df
 
-    # ✅ reset persisted status messages for this run
     st.session_state.embed_status_lines = []
-
     add_to_vector_db()
+
 
     # persist load/embed status so it doesn't disappear after other button clicks
     st.session_state.embed_status_lines.append("✅ CSV files loaded. Vector index rebuilt for RAG.")
