@@ -1,18 +1,7 @@
 # STREAMLIT APP with RAG + Batch Runner + ✅ Conversation Simulator (Customer Bot)
-# ✅ Keeps your original RAG pipeline + structured prompt controls + chat UI
-# ✅ Keeps batch runner output (LONG format)
-# ✅ Adds simulation: Customer Bot generates 1 follow-up turn (optional) and logs full transcript
-#
-# MINIMAL UI + PROMPT BOX SIMPLIFICATION:
-# - Structured Prompt Controls reduced to 6 boxes:
-#   1) Task (shorter)
-#   2) Data access (strict)
-#   3) Style (persona + tone)
-#   4) Conversation policy (scope + workflow)
-#   5) Preference mapping
-#   6) Output Rules
-#
-# No logic changes to RAG / batch / simulation runners beyond parameter wiring.
+# ✅ Minimal change: fix embedding count (19 vs 29) by:
+#   - robust row-to-card creation (case-insensitive columns + SKU support)
+#   - embed summary (loaded rows vs embedded vs skipped)
 
 import io
 import json
@@ -33,7 +22,6 @@ from sentence_transformers import SentenceTransformer
 # -----------------------
 @st.cache_resource
 def get_embed_model():
-    # Force CPU to avoid CUDA/MPS issues on Streamlit Cloud
     return SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
 
 
@@ -54,19 +42,16 @@ def init_state():
     if "vector_db_ready" not in st.session_state:
         st.session_state.vector_db_ready = False
 
-    # ✅ batch results
     if "batch_df" not in st.session_state:
         st.session_state.batch_df = None
     if "batch_last_run" not in st.session_state:
         st.session_state.batch_last_run = ""
 
-    # ✅ simulation results
     if "sim_df" not in st.session_state:
         st.session_state.sim_df = None
     if "sim_last_run" not in st.session_state:
         st.session_state.sim_last_run = ""
 
-    # ✅ persist load/embed status messages across reruns
     if "embed_status_lines" not in st.session_state:
         st.session_state.embed_status_lines = []
 
@@ -75,12 +60,7 @@ def init_state():
 # RAG Functions
 # -----------------------
 def init_vector_db():
-    """
-    Use in-memory Chroma client to avoid Streamlit Cloud persistent DB corruption and
-    embedding-dimension mismatch issues.
-    Each time you upload/load, we rebuild cleanly.
-    """
-    client = chromadb.Client()  # ✅ in-memory
+    client = chromadb.Client()  # in-memory
     st.session_state.vector_db = client.get_or_create_collection(name="odi-grips")
     st.session_state.vector_db_ready = True
 
@@ -90,62 +70,77 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     return model.encode(texts).tolist()
 
 
+# ✅ MINIMAL FIX: robust card builder (case-insensitive + includes SKU + never empty unless row truly empty)
 def _row_to_product_card(row: pd.Series) -> str:
-    """
-    Product card formatting for embeddings + retrieval.
-    IMPORTANT: includes colors so color queries (e.g., purple) can be retrieved.
-    """
-    name_key_candidates = ["product_name", "name", "title", "Product", "Product Name"]
-    prod_name = None
-    for k in name_key_candidates:
-        if k in row.index and pd.notna(row[k]):
-            prod_name = str(row[k]).strip()
-            break
+    # Normalize row keys to a dict with lowercase keys
+    row_dict = {}
+    for k, v in row.items():
+        kk = str(k).strip()
+        vv = "" if v is None else str(v).strip()
+        row_dict[kk] = vv
+        row_dict[kk.lower()] = vv  # allow case-insensitive lookup
 
-    preferred_keys = [
-        "product_name", "Product Name",
-        "category", "Category",
-        "riding_style", "Riding Style",
-        "length_mm", "Length (mm)",
-        "diameter_mm", "Diameter (mm)",
-        "thickness_category", "Thickness Category",
-        "colors", "Colors",
-        "locking_mechanism", "Locking Mechanism",
-        "damping_level", "Damping Level",
-        "vibration_reduction", "Vibration Reduction",
-        "grip_pattern", "Grip Pattern",
-        "price", "Price"
+    def get_val(*keys: str) -> str:
+        for key in keys:
+            if key in row_dict and row_dict[key].strip() != "":
+                return row_dict[key].strip()
+            lk = key.lower()
+            if lk in row_dict and row_dict[lk].strip() != "":
+                return row_dict[lk].strip()
+        return ""
+
+    sku = get_val("sku", "SKU")
+    product_name = get_val("product_name", "Product Name", "product", "Product", "name", "Name", "title", "Title")
+
+    # Canonical fields matching your sheet (lowercase headers)
+    preferred_fields = [
+        ("SKU", ["sku", "SKU"]),
+        ("Product Name", ["product_name", "Product Name"]),
+        ("Category", ["category", "Category"]),
+        ("Riding Style", ["riding_style", "Riding Style"]),
+        ("Length (mm)", ["length_mm", "Length (mm)"]),
+        ("Diameter (mm)", ["diameter_mm", "Diameter (mm)"]),
+        ("Thickness Category", ["thickness_category", "Thickness Category"]),
+        ("Colors", ["colors", "Colors"]),
+        ("Locking Mechanism", ["locking_mechanism", "Locking Mechanism"]),
+        ("Damping Level", ["damping_level", "Damping Level"]),
+        ("Vibration Reduction", ["vibration_reduction", "Vibration Reduction"]),
+        ("Grip Pattern", ["grip_pattern", "Grip Pattern"]),
+        ("Price", ["price", "Price"]),
     ]
 
     lines = []
-    if prod_name:
-        lines.append(f"Product: {prod_name}")
 
-    for k in preferred_keys:
-        if k in row.index and pd.notna(row[k]):
-            val = str(row[k]).strip()
-            if val:
-                label = str(k).replace("_", " ").title()
-                lines.append(f"{label}: {val}")
+    # Always try to start with a stable identity line
+    if product_name:
+        lines.append(f"Product: {product_name}")
+    elif sku:
+        lines.append(f"Product: {sku}")
 
-    # Fallback: add a few extra fields so embeddings aren't empty
-    if len(lines) <= 1:
+    # Add fields
+    for label, keys in preferred_fields:
+        val = get_val(*keys)
+        if val:
+            lines.append(f"{label}: {val}")
+
+    # If still too sparse, add any non-empty columns (so card is not empty)
+    if len(lines) == 0:
         extras = []
-        for k, v in row.items():
-            if pd.isna(v):
+        for k, v in row_dict.items():
+            # skip lowercase duplicates
+            if k != k.lower():
                 continue
-            if str(k) in preferred_keys:
-                continue
-            vv = str(v).strip()
-            if vv:
-                extras.append(f"{str(k)}: {vv}")
-            if len(extras) >= 8:
+            if v.strip():
+                extras.append(f"{k}: {v.strip()}")
+            if len(extras) >= 12:
                 break
         if extras:
             lines.append("Other:")
             lines.extend(extras)
 
-    return "\n".join(lines).strip()
+    # Final guard: only return empty if truly empty row
+    card = "\n".join(lines).strip()
+    return card
 
 
 def add_to_vector_db():
@@ -162,20 +157,35 @@ def add_to_vector_db():
 
     all_texts, ids, metadata = [], [], []
 
+    total_rows = 0
+    skipped_existing = 0
+    skipped_truly_empty = 0
+
     for fname, df in st.session_state.datasets.items():
         df = df.reset_index(drop=True)
+        total_rows += len(df)
+
         for i, row in df.iterrows():
             chunk_id = f"{fname}::row-{i}"
             if chunk_id in existing_ids:
+                skipped_existing += 1
                 continue
 
             card = _row_to_product_card(row)
-            if not card:
+
+            # If card is empty, row is truly empty -> skip
+            if not card.strip():
+                skipped_truly_empty += 1
                 continue
 
             all_texts.append(card)
             ids.append(chunk_id)
             metadata.append({"source": fname, "row_index": int(i)})
+
+    st.info(
+        f"Loaded rows: {total_rows} | Embedded: {len(all_texts)} | "
+        f"Skipped existing: {skipped_existing} | Skipped empty rows: {skipped_truly_empty}"
+    )
 
     if not all_texts:
         st.info("No rows to embed (empty dataset).")
@@ -500,8 +510,8 @@ def run_conversation_simulation(
     preference_mapping: str,
     output_rules: str,
     seed_questions: List[str],
-    assistant_models: Dict[str, str],     # models to test as the ODI assistant
-    customer_model_id: str,               # model used for the customer simulator
+    assistant_models: Dict[str, str],
+    customer_model_id: str,
     customer_system: str,
     top_k: int = 5,
     assistant_temp: float = 0.2,
@@ -513,8 +523,6 @@ def run_conversation_simulation(
     rows = []
     model_items = list(assistant_models.items())
 
-    # total calls = per seed question per assistant model:
-    # assistant answer (1) + customer follow-up (optional 1) + assistant follow-up answer (optional 1)
     per_conv_calls = 1 + (2 if enable_followup else 0)
     total_calls = max(1, len(seed_questions) * len(model_items) * per_conv_calls)
     done = 0
@@ -522,7 +530,6 @@ def run_conversation_simulation(
 
     for convo_id, seed_q in enumerate(seed_questions, start=1):
         for label, assistant_model_id in model_items:
-            # Turn 1: assistant responds to seed question
             rag_context_1 = rag_retrieve_context(seed_q, top_k=top_k)
             sys_prompt_1 = build_system_prompt(
                 task, data_rules, style, conversation_policy, preference_mapping, output_rules, rag_context_1
@@ -544,10 +551,8 @@ def run_conversation_simulation(
             ]
 
             followup_q = ""
-            assistant_answer_2 = ""
             rag_context_2 = ""
 
-            # Optional follow-up turn
             if enable_followup and not str(assistant_answer_1).startswith("ERROR:"):
                 followup_q = safe_customer_followup(
                     api_key=api_key,
@@ -564,7 +569,6 @@ def run_conversation_simulation(
                 if followup_q.strip().upper() != "NO_FOLLOWUP" and not followup_q.startswith("ERROR:"):
                     transcript.append({"role": "user", "content": followup_q})
 
-                    # Turn 2: assistant responds to follow-up (retrieve context on follow-up question)
                     rag_context_2 = rag_retrieve_context(followup_q, top_k=top_k)
                     sys_prompt_2 = build_system_prompt(
                         task, data_rules, style, conversation_policy, preference_mapping, output_rules, rag_context_2
@@ -589,7 +593,6 @@ def run_conversation_simulation(
                 "seed_question": seed_q,
                 "followup_question": followup_q if enable_followup else "",
                 "messages": transcript,
-                # Optional fields you may want for debugging / analysis:
                 "rag_context_seed": rag_context_1,
                 "rag_context_followup": rag_context_2,
             })
@@ -631,7 +634,6 @@ with st.sidebar:
 
     show_debug = st.checkbox("Show RAG Debug (retrieved context)", value=False)
 
-# ✅ Sidebar debug: always show loaded columns if debug is on (moved outside button handler)
 if show_debug and st.session_state.datasets:
     st.sidebar.markdown("### ✅ Loaded CSV Columns")
     for fname, df in st.session_state.datasets.items():
@@ -661,11 +663,8 @@ if st.button("🔄 Load & Embed CSVs"):
     st.session_state.embed_status_lines = []
     add_to_vector_db()
 
-
-    # persist load/embed status so it doesn't disappear after other button clicks
     st.session_state.embed_status_lines.append("✅ CSV files loaded. Vector index rebuilt for RAG.")
 
-    # ✅ Keyword sanity check (kept in same location to avoid other changes)
     target_full = "vanquish lock-on grips"
     target_short = "vanquish"
 
@@ -683,7 +682,6 @@ if st.button("🔄 Load & Embed CSVs"):
     else:
         st.session_state.embed_status_lines.append("✅ Sanity Check Passed: Vanquish found in loaded CSVs (pre-embedding).")
 
-# ✅ Show persisted embed/load messages (survive reruns)
 if st.session_state.get("embed_status_lines"):
     for line in st.session_state.embed_status_lines:
         if line.startswith("❌"):
@@ -776,12 +774,8 @@ if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
                 max_tokens=int(batch_max_tokens),
             )
 
-        # (Kept for minimal change; batch df doesn't include rag_context unless you add it)
         if not include_context_col and "rag_context" in df.columns:
             df = df.drop(columns=["rag_context"])
-
-        if not df.empty and "conversation_id" in df.columns:
-            df = df[["conversation_id"] + [c for c in df.columns if c != "conversation_id"]]
 
         st.session_state.batch_df = df
         st.session_state.batch_last_run = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -899,9 +893,6 @@ if st.button("🧪 Run Conversation Simulation", disabled=sim_run_disabled, use_
             if drop_cols:
                 sim_df = sim_df.drop(columns=drop_cols)
 
-        if not sim_df.empty and "conversation_id" in sim_df.columns:
-            sim_df = sim_df[["conversation_id"] + [c for c in sim_df.columns if c != "conversation_id"]]
-
         st.session_state.sim_df = sim_df
         st.session_state.sim_last_run = time.strftime("%Y-%m-%d %H:%M:%S")
         st.success(f"Simulation finished at {st.session_state.sim_last_run}. Rows: {len(sim_df)}")
@@ -949,13 +940,7 @@ with chat_a1:
 with chat_a2:
     def transcript_json():
         return json.dumps(
-            [
-                {
-                    "conversation_id": 1,
-                    "model": model,
-                    "messages": st.session_state.chat,
-                }
-            ],
+            [{"conversation_id": 1, "model": model, "messages": st.session_state.chat}],
             indent=2,
             ensure_ascii=False,
         )
