@@ -3,12 +3,16 @@
 # ✅ Keeps batch runner output (LONG format)
 # ✅ Adds simulation: Customer Bot generates 1 follow-up turn (optional) and logs full transcript
 #
-# WHAT CHANGED (summary) — MINIMAL UI + TRANSCRIPT FORMAT ADJUSTMENTS:
-# 1) ✅ Removed "PA6" / "PA7" text from UI + comments (kept the same features)
-# 2) ✅ Single Chat "Download Transcript" JSON now matches the batch-style output:
-#    -> list of records with {conversation_id, model, messages}
+# MINIMAL UI + PROMPT BOX SIMPLIFICATION:
+# - Structured Prompt Controls reduced to 6 boxes:
+#   1) Task (shorter)
+#   2) Data access (strict)
+#   3) Style (persona + tone)
+#   4) Conversation policy (scope + workflow)
+#   5) Preference mapping
+#   6) Output Rules
 #
-# No new features added. No logic changes to RAG / batch / simulation runners.
+# No logic changes to RAG / batch / simulation runners beyond parameter wiring.
 
 import io
 import json
@@ -99,18 +103,18 @@ def _row_to_product_card(row: pd.Series) -> str:
             break
 
     preferred_keys = [
-    "product_name", "Product Name",
-    "category", "Category",
-    "riding_style", "Riding Style",
-    "length_mm", "Length (mm)",
-    "diameter_mm", "Diameter (mm)",
-    "thickness_category", "Thickness Category",
-    "colors", "Colors",
-    "locking_mechanism", "Locking Mechanism",
-    "damping_level", "Damping Level",
-    "vibration_reduction", "Vibration Reduction",
-    "grip_pattern", "Grip Pattern",
-    "price", "Price"
+        "product_name", "Product Name",
+        "category", "Category",
+        "riding_style", "Riding Style",
+        "length_mm", "Length (mm)",
+        "diameter_mm", "Diameter (mm)",
+        "thickness_category", "Thickness Category",
+        "colors", "Colors",
+        "locking_mechanism", "Locking Mechanism",
+        "damping_level", "Damping Level",
+        "vibration_reduction", "Vibration Reduction",
+        "grip_pattern", "Grip Pattern",
+        "price", "Price"
     ]
 
     lines = []
@@ -210,136 +214,104 @@ def rag_retrieve_context(query: str, top_k: int = 5) -> str:
 
 
 # -----------------------
-# Defaults (Structured Prompts)
+# Defaults (Structured Prompts) — SIMPLIFIED (6 boxes)
 # -----------------------
 DEFAULT_TASK = (
-    "You are an expert ODI grip specialist helping users of all levels—beginner to expert—"
-    "choose the most suitable grip from ODI's product range based strictly on the uploaded CSV dataset. "
-    "Your job is to recommend the best grip for their specific riding style, comfort needs, hand size, and skill level."
+    "You are an expert ODI grip specialist. Recommend the most suitable ODI grip "
+    "based strictly on the uploaded CSV dataset and the retrieved RAG context."
 )
 
-DEFAULT_PERSONA = (
-    "The user may be a beginner or an experienced rider. Use simple, clear explanations for beginners "
-    "(avoid technical jargon), and use more technical language if the user shows expertise or uses advanced terms. "
-    "Always adapt based on how they describe their needs."
-)
-
-DEFAULT_TONE = (
-    "Respond in a professional, supportive, and informative tone—similar to a knowledgeable customer service expert "
-    "in a high-end bike shop. Encourage beginners and build trust with experienced riders."
-)
-
-DEFAULT_DATA_RULES = """DATA RULES (STRICT):
-- Use ONLY information retrieved from the embedded ODI product dataset.
-- Do NOT browse the web, cite webpages, or use external reviews/knowledge.
-- Do NOT invent features, prices, specs, availability, or “best overall” claims.
-- If a detail is not in the retrieved context, say you’re not sure and ask a clarifying question instead.
-- Only ODI grips are allowed. Never recommend competitor brands.
-- Always recommend at least one specific product name from the retrieved context if a match is found.
-- If the user mentions a color (e.g., purple), prioritize products whose Colors include that color in the retrieved context.
+DEFAULT_DATA_RULES = """DATA ACCESS (STRICT):
+- Use ONLY information retrieved from the embedded ODI product dataset (RAG context).
+- Do NOT browse the web or use external reviews/knowledge.
+- Do NOT invent specs, pricing, availability, or claims not shown in the retrieved context.
+- Only ODI grips are allowed (no competitor brands).
+- If the retrieved context lacks what you need, say so and ask ONE clarifying question.
 """
 
-DEFAULT_SCOPE = """SCOPE:
-This assistant supports ALL ODI grips in the dataset (e.g., MTB, BMX, Moto, Urban/Casual).
-If the user asks about a category not supported, explain the limitation and ask follow-up.
-Identify the riding category early (MTB vs BMX vs Moto vs Casual) because it strongly affects which grips fit.
+DEFAULT_STYLE = """STYLE (PERSONA + TONE):
+- If user is a beginner: use simple, clear explanations and avoid jargon.
+- If user is experienced: you may use more technical terms.
+- Tone: professional, supportive, and informative (like a helpful bike shop expert).
 """
 
-DEFAULT_PREF_SCHEMA = """PREFERENCES (ONLY THESE AFFECT RECOMMENDATIONS):
+DEFAULT_CONVERSATION_POLICY = """CONVERSATION POLICY (SCOPE + WORKFLOW):
+Scope:
+- Supports ODI grips in the dataset (MTB, BMX, Moto, Urban/Casual).
+- If the user’s category is unclear, ask ONE question to clarify (MTB vs BMX vs Moto vs Casual).
 
+Workflow:
+1) Identify what they ride + the problem to solve (comfort, control, numbness, hand size).
+2) Ask ONE focused follow-up question only when needed.
+3) Once enough info is present, recommend grip(s) using ONLY the retrieved context.
+"""
+
+DEFAULT_PREFERENCE_MAPPING = """PREFERENCE MAPPING (SCHEMA + HINTS):
 Keys:
 - riding_style
 - locking_mechanism
-- thickness
+- thickness_category
 - damping_level
-- durability
+- vibration_reduction
+- diameter_mm
+- length_mm
+- colors
+- grip_pattern
+- price
 
-Allowed values:
-riding_style: trail, enduro, downhill, cross-country, bmx, moto, urban, casual
-locking_mechanism: lock-on, slip-on
-thickness: thin, medium, thick, medium-thick size xl
-damping_level: low, medium, high
-durability: low, medium, high
+Mapping hints (use only when intent is clear):
+- “BMX / park / street” -> riding_style=bmx
+- “trail / all-mountain / mixed terrain” -> riding_style=trail
+- “enduro / aggressive” -> riding_style=enduro
+- “downhill / bike park” -> riding_style=downhill
+- “XC / racing / long climbs” -> riding_style=cross-country
+- “commute / city” -> riding_style=urban
+- “casual / comfort / e-bike” -> riding_style=casual
 
-Rules:
-- Only set a preference if the user clearly indicates it.
-- If unclear, leave it unset and ask ONE follow-up question.
+- “lock-on / clamps” -> locking_mechanism=lock-on
+- “slip-on / push-on” -> locking_mechanism=slip-on
+
+- “hands numb / vibration / shock absorption” -> prefer higher damping_level and/or vibration_reduction
+- “large hands” -> prefer larger diameter_mm / thicker thickness_category (if shown in context)
+- Color requests: prioritize grips whose colors include the requested color (if shown).
 """
 
-DEFAULT_MAPPING = """MAPPING HINTS (use only when intent is clear): 
-riding_style: 
-- “BMX / park / street tricks” -> bmx 
-- “Rocky trails / mixed terrain / all-mountain” -> trail 
-- “Enduro / aggressive trail / rough descents” -> enduro 
-- “Downhill / bike park / steep fast” -> downhill 
-- “XC / racing / long climbs” -> cross-country 
-- “Moto” -> moto 
-- “Commuting / city rides” -> urban 
-- “Casual cruising / e-bike comfort” -> casual 
-
-thickness: 
-- “small hands / slim / skinny” -> thin 
-- “chunky / fat / big / extra padding” -> thick 
-- “large hands / XL gloves” -> medium-thick size xl (only if user indicates XL/very large hands) 
-
-damping_level: 
-- “hands numb / vibration / shock absorption / rocky” -> high 
-- “balanced” -> medium 
-- “more trail feel / firm” -> low 
-
-locking_mechanism: 
-- “lock-on / clamps” -> lock-on 
-- “slip-on / push-on” -> slip-on 
-
-durability: 
-- “long-lasting / hard riding / abrasive trails” -> high
-"""
-
-DEFAULT_WORKFLOW = """WORKFLOW:
-1) Welcome the user and ask what they ride + what problem they want to solve (comfort, control, numbness, hand size, etc.). 
-2) Identify riding_style early if possible.
-3) Ask ONE focused follow-up question at a time to fill missing preferences.
-4) Once enough preferences are collected, recommend grips based ONLY on the dataset.
-5) Briefly explain why the suggested grips match the stated preferences, without adding unsupported details.
-"""
-
-DEFAULT_OUTPUT_RULES = """RESPONSE FORMAT:
-- Replies = 2–6 sentences
+DEFAULT_OUTPUT_RULES = """OUTPUT RULES:
+- 2–6 sentences.
 - Include:
-  (a) acknowledgment
-  (b) recommendation (include at least one named product when available)
-  (c) one follow-up if needed
-- Avoid long lists or multiple follow-ups
+  (a) acknowledgement
+  (b) recommendation with at least ONE exact product_name from the retrieved context (if found)
+  (c) ask ONE follow-up question only if needed
+- Avoid long lists. Avoid multiple follow-up questions.
 """
 
 
-def build_system_prompt(task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, rag_context):
+def build_system_prompt(
+    task: str,
+    data_rules: str,
+    style: str,
+    conversation_policy: str,
+    preference_mapping: str,
+    output_rules: str,
+    rag_context: str
+) -> str:
     return f"""
-[Task Definition]
+[Task]
 {task}
 
-[Customer Persona]
-{persona}
-
-[Tone & Language Style]
-{tone}
-
-[Data Access & Grounding Rules]
+[Data Access & Grounding]
 {data_rules}
 
-[Scope & Category Handling]
-{scope}
+[Style]
+{style}
 
-[Preference Schema]
-{pref_schema}
+[Conversation Policy]
+{conversation_policy}
 
-[Mapping Guide]
-{mapping_guide}
+[Preference Mapping]
+{preference_mapping}
 
-[Conversation Workflow]
-{workflow}
-
-[Output Format Rules]
+[Output Rules]
 {output_rules}
 
 [RAG Context Retrieved for this Query]
@@ -441,13 +413,10 @@ def safe_call_one(
 def run_batch_eval(
     api_key: str,
     task: str,
-    persona: str,
-    tone: str,
     data_rules: str,
-    scope: str,
-    pref_schema: str,
-    mapping_guide: str,
-    workflow: str,
+    style: str,
+    conversation_policy: str,
+    preference_mapping: str,
     output_rules: str,
     questions: List[str],
     selected_models: Dict[str, str],
@@ -464,7 +433,7 @@ def run_batch_eval(
     for idx, q in enumerate(questions, start=1):
         rag_context = rag_retrieve_context(q, top_k=top_k)
         sys_prompt = build_system_prompt(
-            task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, rag_context
+            task, data_rules, style, conversation_policy, preference_mapping, output_rules, rag_context
         )
 
         for label, model_id in model_items:
@@ -528,13 +497,10 @@ def safe_customer_followup(
 def run_conversation_simulation(
     api_key: str,
     task: str,
-    persona: str,
-    tone: str,
     data_rules: str,
-    scope: str,
-    pref_schema: str,
-    mapping_guide: str,
-    workflow: str,
+    style: str,
+    conversation_policy: str,
+    preference_mapping: str,
     output_rules: str,
     seed_questions: List[str],
     assistant_models: Dict[str, str],     # models to test as the ODI assistant
@@ -562,7 +528,7 @@ def run_conversation_simulation(
             # Turn 1: assistant responds to seed question
             rag_context_1 = rag_retrieve_context(seed_q, top_k=top_k)
             sys_prompt_1 = build_system_prompt(
-                task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, rag_context_1
+                task, data_rules, style, conversation_policy, preference_mapping, output_rules, rag_context_1
             )
             assistant_answer_1 = safe_call_one(
                 api_key=api_key,
@@ -604,7 +570,7 @@ def run_conversation_simulation(
                     # Turn 2: assistant responds to follow-up (retrieve context on follow-up question)
                     rag_context_2 = rag_retrieve_context(followup_q, top_k=top_k)
                     sys_prompt_2 = build_system_prompt(
-                        task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, rag_context_2
+                        task, data_rules, style, conversation_policy, preference_mapping, output_rules, rag_context_2
                     )
                     assistant_answer_2 = safe_call_one(
                         api_key=api_key,
@@ -726,14 +692,11 @@ if st.session_state.get("embed_status_lines"):
 with st.expander("🧠 Structured Prompt Controls", expanded=True):
     st.subheader("Prompt Settings")
     task = st.text_area("Task", value=DEFAULT_TASK)
-    persona = st.text_area("Persona", value=DEFAULT_PERSONA)
-    tone = st.text_area("Tone", value=DEFAULT_TONE)
-    data_rules = st.text_area("Data Rules", value=DEFAULT_DATA_RULES)
-    scope = st.text_area("Scope", value=DEFAULT_SCOPE)
-    pref_schema = st.text_area("Preferences", value=DEFAULT_PREF_SCHEMA)
-    mapping_guide = st.text_area("Mapping", value=DEFAULT_MAPPING)
-    workflow = st.text_area("Workflow", value=DEFAULT_WORKFLOW)
-    output_rules = st.text_area("Format Rules", value=DEFAULT_OUTPUT_RULES)
+    data_rules = st.text_area("Data Access (Strict)", value=DEFAULT_DATA_RULES)
+    style = st.text_area("Style (Persona + Tone)", value=DEFAULT_STYLE)
+    conversation_policy = st.text_area("Conversation Policy (Scope + Workflow)", value=DEFAULT_CONVERSATION_POLICY)
+    preference_mapping = st.text_area("Preference Mapping", value=DEFAULT_PREFERENCE_MAPPING)
+    output_rules = st.text_area("Output Rules", value=DEFAULT_OUTPUT_RULES)
 
 st.subheader("Actions")
 a1 = st.columns(1)[0]
@@ -798,8 +761,12 @@ if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
         with st.spinner("Running batch… this will call the selected model(s) for each question."):
             df = run_batch_eval(
                 api_key=api_key,
-                task=task, persona=persona, tone=tone, data_rules=data_rules, scope=scope,
-                pref_schema=pref_schema, mapping_guide=mapping_guide, workflow=workflow, output_rules=output_rules,
+                task=task,
+                data_rules=data_rules,
+                style=style,
+                conversation_policy=conversation_policy,
+                preference_mapping=preference_mapping,
+                output_rules=output_rules,
                 questions=questions,
                 selected_models=selected_models,
                 top_k=int(top_k),
@@ -807,6 +774,7 @@ if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
                 max_tokens=int(batch_max_tokens),
             )
 
+        # (Kept for minimal change; batch df doesn't include rag_context unless you add it)
         if not include_context_col and "rag_context" in df.columns:
             df = df.drop(columns=["rag_context"])
 
@@ -906,8 +874,12 @@ if st.button("🧪 Run Conversation Simulation", disabled=sim_run_disabled, use_
         with st.spinner("Running simulation… (Customer Bot + Assistant Bot)"):
             sim_df = run_conversation_simulation(
                 api_key=api_key,
-                task=task, persona=persona, tone=tone, data_rules=data_rules, scope=scope,
-                pref_schema=pref_schema, mapping_guide=mapping_guide, workflow=workflow, output_rules=output_rules,
+                task=task,
+                data_rules=data_rules,
+                style=style,
+                conversation_policy=conversation_policy,
+                preference_mapping=preference_mapping,
+                output_rules=output_rules,
                 seed_questions=sim_seed_questions,
                 assistant_models=sim_assistant_models,
                 customer_model_id=customer_model,
@@ -1012,7 +984,7 @@ if user_msg:
             st.text(context)
 
     sys_prompt = build_system_prompt(
-        task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, context
+        task, data_rules, style, conversation_policy, preference_mapping, output_rules, context
     )
 
     with st.chat_message("assistant"):
