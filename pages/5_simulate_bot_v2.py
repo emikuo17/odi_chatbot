@@ -648,9 +648,15 @@ if st.button("🔄 Load & Embed CSVs"):
 
     st.session_state.datasets = {}
     for f in csv_files:
-        df = pd.read_csv(f)
-        df.columns = [c.strip() for c in df.columns]
-        st.session_state.datasets[f.name] = df
+    df = pd.read_csv(
+        f,
+        dtype=str,
+        engine="python",
+        keep_default_na=False
+    )
+    df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
+    df = df.fillna("")
+    st.session_state.datasets[f.name] = df
 
     # ✅ reset persisted status messages for this run
     st.session_state.embed_status_lines = []
