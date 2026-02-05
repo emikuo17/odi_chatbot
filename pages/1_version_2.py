@@ -1,8 +1,19 @@
-# STREAMLIT APP with RAG EXTENSION (minimal fixes for color + debug + NO persistent DB corruption)
-# ✅ FIX for Streamlit Cloud NotImplementedError: lazy-load SentenceTransformer + force CPU
-# ✅ Adds LLM selector: GPT / Claude / Gemini (OpenRouter model IDs)
-# ✅ Keeps your original structure, just minimal safe changes
+# STREAMLIT APP with RAG EXTENSION + PA6 Batch Runner (Selectable LLMs)
+# ✅ Keeps your original RAG pipeline + structured prompt controls + chat UI
+# ✅ Adds (minimal changes):
+#    1) Batch results include FIRST column: conversation_id = 1,2,3,...
+#    2) After batch run: download BOTH CSV + JSON
+#    3) Batch runner: choose which LLM(s) to run (1, 2, or all 3)
+# ✅ UPDATE: LLM IDs changed to newer models on OpenRouter (GPT-4.1-mini, Claude Sonnet 4.5, Gemini 2.5 Flash)
 
+# ✅ YOUR REQUESTED CHANGES (ONLY):
+# 1) Remove JSON wrapper layer: generated_at / row_count / data
+#    -> JSON output becomes a plain list: [ {...}, {...} ]
+# 2) Change JSON output key from "model_id" -> "model"
+#    -> internal calling still uses model_id variable; only the OUTPUT key is renamed
+# Everything else remains the same.
+
+import io
 import json
 import time
 from typing import Dict, List
@@ -42,14 +53,20 @@ def init_state():
     if "vector_db_ready" not in st.session_state:
         st.session_state.vector_db_ready = False
 
+    # ✅ PA6 batch results
+    if "batch_df" not in st.session_state:
+        st.session_state.batch_df = None
+    if "batch_last_run" not in st.session_state:
+        st.session_state.batch_last_run = ""
+
 
 # -----------------------
 # RAG Functions
 # -----------------------
 def init_vector_db():
     """
-    FIX: Use in-memory Chroma client to avoid Streamlit Cloud persistent DB corruption and
-    embedding-dimension mismatch issues that cause chromadb.errors.InternalError on .add().
+    Use in-memory Chroma client to avoid Streamlit Cloud persistent DB corruption and
+    embedding-dimension mismatch issues.
     Each time you upload/load, we rebuild cleanly.
     """
     client = chromadb.Client()  # ✅ in-memory
@@ -65,7 +82,7 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
 def _row_to_product_card(row: pd.Series) -> str:
     """
     Product card formatting for embeddings + retrieval.
-    IMPORTANT FIX: includes 'colors'/'Colors' so color queries (e.g., purple) can be retrieved.
+    IMPORTANT: includes colors so color queries (e.g., purple) can be retrieved.
     """
     name_key_candidates = ["product_name", "name", "title", "Product", "Product Name"]
     prod_name = None
@@ -283,9 +300,9 @@ durability:
 
 DEFAULT_WORKFLOW = """WORKFLOW:
 1) Welcome the user and ask what they ride + what problem they want to solve (comfort, control, numbness, hand size, etc.). 
-2) Identify riding_style early if possible. 
-3) Ask ONE focused follow-up question at a time to fill missing preferences. 
-4) Once enough preferences are collected, recommend grips based ONLY on the dataset. 
+2) Identify riding_style early if possible.
+3) Ask ONE focused follow-up question at a time to fill missing preferences.
+4) Once enough preferences are collected, recommend grips based ONLY on the dataset.
 5) Briefly explain why the suggested grips match the stated preferences, without adding unsupported details.
 """
 
@@ -341,8 +358,14 @@ IMPORTANT:
 # -----------------------
 # OpenRouter LLM Call
 # -----------------------
-def call_llm_openrouter(api_key: str, model: str, system_prompt: str, messages: List[Dict[str, str]],
-                        temperature: float = 0.2, max_tokens: int = 600) -> str:
+def call_llm_openrouter(
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    messages: List[Dict[str, str]],
+    temperature: float = 0.2,
+    max_tokens: int = 600,
+) -> str:
     url = "https://openrouter.ai/api/v1/chat/completions"
     payload = {
         "model": model,
@@ -366,6 +389,94 @@ def call_llm_openrouter(api_key: str, model: str, system_prompt: str, messages: 
 
 
 # -----------------------
+# PA6 Batch Runner Helpers (Selectable LLMs)
+# -----------------------
+# ✅ Updated to newer OpenRouter models
+BATCH_MODELS = {
+    "GPT (OpenAI) — GPT-4.1 Mini": "openai/gpt-4.1-mini",
+    "Claude (Anthropic) — Claude Sonnet 4.5": "anthropic/claude-sonnet-4.5",
+    "Gemini (Google) — Gemini 2.5 Flash": "google/gemini-2.5-flash",
+}
+
+
+def safe_call_one(
+    api_key: str,
+    model_id: str,
+    sys_prompt: str,
+    question: str,
+    temperature: float = 0.2,
+    max_tokens: int = 600,
+) -> str:
+    try:
+        msgs = [{"role": "user", "content": question}]
+        return call_llm_openrouter(api_key, model_id, sys_prompt, msgs, temperature=temperature, max_tokens=max_tokens)
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def run_batch_eval(
+    api_key: str,
+    task: str,
+    persona: str,
+    tone: str,
+    data_rules: str,
+    scope: str,
+    pref_schema: str,
+    mapping_guide: str,
+    workflow: str,
+    output_rules: str,
+    questions: List[str],
+    selected_models: Dict[str, str],
+    top_k: int = 5,
+    temperature: float = 0.2,
+    max_tokens: int = 600,
+) -> pd.DataFrame:
+    rows = []
+    model_items = list(selected_models.items())
+    total_calls = max(1, len(questions) * len(model_items))
+    done = 0
+    prog = st.progress(0)
+
+    for idx, q in enumerate(questions, start=1):
+        rag_context = rag_retrieve_context(q, top_k=top_k)
+        sys_prompt = build_system_prompt(
+            task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, rag_context
+        )
+
+        # ✅ LONG format: one row per (question, model)
+        for label, model_id in model_items:
+            ans = safe_call_one(
+                api_key=api_key,
+                model_id=model_id,
+                sys_prompt=sys_prompt,
+                question=q,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+            # ✅ ONLY CHANGE: output key "model" (not model_id)
+            rows.append({
+                "conversation_id": idx,
+                "model": model_id,
+                "messages": [
+                    {"role": "user", "content": q},
+                    {"role": "assistant", "content": ans},
+                ],
+            })
+
+            done += 1
+            prog.progress(min(1.0, done / total_calls))
+
+    df = pd.DataFrame(rows)
+
+    # Ensure conversation_id is first column
+    if not df.empty and "conversation_id" in df.columns:
+        df = df[["conversation_id"] + [c for c in df.columns if c != "conversation_id"]]
+
+    return df
+
+
+# -----------------------
 # Streamlit UI Start
 # -----------------------
 init_state()
@@ -373,24 +484,21 @@ init_state()
 st.set_page_config(page_title="ODI Grips Chatbot (RAG)", page_icon="🚵", layout="wide")
 st.title("🚵 ODI Grips Chatbot (with RAG)")
 
-# ✅ Model presets for dropdown (OpenRouter model IDs)
-# If your OpenRouter account uses different IDs, just change the strings below.
 MODEL_PRESETS = {
-    "GPT (OpenAI) — gpt-4o-mini": "openai/gpt-4o-mini",
-    "Claude (Anthropic) — claude-3.5-sonnet": "anthropic/claude-3.5-sonnet",
-    # Google (Gemini) — USE FLASH, NOT PRO (more endpoints available)
-    "Gemini (Google) — Gemini 2.0 Flash": "google/gemini-2.0-flash-001",
-    # Backup Gemini (sometimes available, sometimes not)
-    "Gemini (Google) — Gemini 1.5 Flash": "google/gemini-1.5-flash",
+    "GPT (OpenAI) — GPT-4.1 Mini": "openai/gpt-4.1-mini",
+    "GPT (OpenAI) — GPT-4.1 (larger)": "openai/gpt-4.1",
+    "Claude (Anthropic) — Claude Sonnet 4.5": "anthropic/claude-sonnet-4.5",
+    "Gemini (Google) — Gemini 2.5 Flash": "google/gemini-2.5-flash",
+    "Custom (type your own model ID)": "__custom__",
 }
 
 with st.sidebar:
     st.header("LLM Settings")
     api_key = st.text_input("OpenRouter API Key", type="password")
 
-    model_choice = st.selectbox("Choose LLM", list(MODEL_PRESETS.keys()), index=0)
+    model_choice = st.selectbox("Choose LLM (Chat mode)", list(MODEL_PRESETS.keys()), index=0)
     if MODEL_PRESETS[model_choice] == "__custom__":
-        model = st.text_input("Model (OpenRouter ID)", value="openai/gpt-4o-mini")
+        model = st.text_input("Model (OpenRouter ID)", value="openai/gpt-4.1-mini")
     else:
         model = MODEL_PRESETS[model_choice]
         st.caption(f"Using model: `{model}`")
@@ -444,7 +552,7 @@ with a1:
             try:
                 ping_system = "You are a helpful assistant. Reply exactly with 'LLM OK'."
                 ping_messages = [{"role": "user", "content": "LLM OK"}]
-                out = call_llm_openrouter(api_key, model, ping_system, ping_messages, temperature=0.0, max_tokens=10)
+                out = call_llm_openrouter(api_key, model, ping_system, ping_messages, temperature=0.0, max_tokens=50)
                 st.session_state.llm_confirmed = "LLM OK" in out
                 st.session_state.last_confirm_result = f"Response: {out}"
                 st.toast("LLM setup checked.")
@@ -459,7 +567,11 @@ with a2:
 
 with a3:
     def transcript_json():
-        return json.dumps({"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "messages": st.session_state.chat}, indent=2)
+        return json.dumps(
+            {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "messages": st.session_state.chat},
+            indent=2,
+            ensure_ascii=False,
+        )
 
     st.download_button(
         "⬇️ Download Transcript",
@@ -472,7 +584,103 @@ with a3:
 if st.session_state.last_confirm_result:
     st.info(st.session_state.last_confirm_result)
 
-st.subheader("💬 Chat")
+# -----------------------
+# ✅ PA6 Batch Evaluation Section
+# -----------------------
+st.divider()
+st.header("📊 PA6 Batch Evaluation (Run Questions × Selectable LLMs)")
+
+colA, colB = st.columns([2, 1])
+with colA:
+    questions_text = st.text_area(
+        "Paste your questions (one per line). Example: Colby 10 questions.",
+        height=220,
+        placeholder="Question 1...\nQuestion 2...\n..."
+    )
+with colB:
+    top_k = st.number_input("RAG top_k", min_value=1, max_value=15, value=5, step=1)
+    batch_temp = st.slider("Batch temperature", min_value=0.0, max_value=1.0, value=0.2, step=0.05)
+    batch_max_tokens = st.number_input("Batch max_tokens", min_value=100, max_value=2000, value=600, step=50)
+    include_context_col = st.checkbox("Include rag_context column in downloads", value=True)
+
+    selected_labels = st.multiselect(
+        "Choose LLM(s) to run in batch",
+        options=list(BATCH_MODELS.keys()),
+        default=list(BATCH_MODELS.keys()),
+    )
+    selected_models = {label: BATCH_MODELS[label] for label in selected_labels}
+
+questions = [q.strip() for q in questions_text.splitlines() if q.strip()]
+
+run_disabled = (not api_key) or (len(questions) == 0) or (len(selected_models) == 0)
+if (not api_key) or (len(questions) == 0):
+    st.caption("To run batch: enter API key + paste at least 1 question. Also upload & embed CSVs for real RAG results.")
+elif len(selected_models) == 0:
+    st.caption("Select at least one LLM to run.")
+
+if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
+    if st.session_state.vector_db is None or not st.session_state.vector_db_ready:
+        st.warning("RAG is not ready. Please upload CSVs and click 'Load & Embed CSVs' first.")
+    else:
+        with st.spinner("Running batch… this will call the selected model(s) for each question."):
+            df = run_batch_eval(
+                api_key=api_key,
+                task=task, persona=persona, tone=tone, data_rules=data_rules, scope=scope,
+                pref_schema=pref_schema, mapping_guide=mapping_guide, workflow=workflow, output_rules=output_rules,
+                questions=questions,
+                selected_models=selected_models,
+                top_k=int(top_k),
+                temperature=float(batch_temp),
+                max_tokens=int(batch_max_tokens),
+            )
+
+        if not include_context_col and "rag_context" in df.columns:
+            df = df.drop(columns=["rag_context"])
+
+        # Ensure conversation_id is still first
+        if not df.empty and "conversation_id" in df.columns:
+            df = df[["conversation_id"] + [c for c in df.columns if c != "conversation_id"]]
+
+        st.session_state.batch_df = df
+        st.session_state.batch_last_run = time.strftime("%Y-%m-%d %H:%M:%S")
+        st.success(f"Batch finished at {st.session_state.batch_last_run}. Rows: {len(df)}")
+
+if st.session_state.batch_df is not None:
+    st.subheader("✅ Batch Results")
+    st.caption(f"Last run: {st.session_state.batch_last_run}")
+    st.dataframe(st.session_state.batch_df, use_container_width=True)
+
+    csv_bytes = st.session_state.batch_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download CSV (.csv)",
+        data=csv_bytes,
+        file_name=f"pa6_batch_results_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    # ✅ CHANGE 1: remove wrapper generated_at/row_count/data
+    # ✅ CHANGE 2: keep JSON as plain list records
+    json_bytes = json.dumps(
+        st.session_state.batch_df.to_dict(orient="records"),
+        indent=2,
+        ensure_ascii=False
+    ).encode("utf-8")
+
+    st.download_button(
+        "⬇️ Download JSON (.json)",
+        data=json_bytes,
+        file_name=f"pa6_batch_results_{time.strftime('%Y%m%d_%H%M%S')}.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+# -----------------------
+# Chat UI (unchanged)
+# -----------------------
+st.divider()
+st.header("💬 Chat (Single LLM)")
+
 for m in st.session_state.chat:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
