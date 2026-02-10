@@ -1,10 +1,14 @@
 # STREAMLIT APP with RAG + Batch Runner
 # ✅ Minimal change: removed Conversation Simulator (Customer Bot)
 # ✅ Keeps: robust embedding fix (case-insensitive + SKU) + embed summary + batch runner + chat UI
+# ✅ MINIMAL CHANGE: Batch CSV download now outputs an R-friendly LONG format:
+#    conversation_id, llm, llm_label, role, content, product_recommended
+# ✅ Keeps JSON output unchanged
 
 import io
 import json
 import time
+import re
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -385,6 +389,100 @@ def safe_call_one(
         return f"ERROR: {e}"
 
 
+# -----------------------
+# ✅ MINIMAL ADD: helper to extract product recommendation from assistant text
+# - Tries to match exact product_name from loaded datasets
+# - Falls back to "UNKNOWN" if nothing matches
+# -----------------------
+def _build_product_name_set() -> set:
+    names = set()
+    for _fname, _df in st.session_state.datasets.items():
+        cols_lc = [c.lower() for c in _df.columns]
+        if "product_name" in cols_lc:
+            col = _df.columns[cols_lc.index("product_name")]
+            for v in _df[col].astype(str).fillna("").tolist():
+                vv = v.strip()
+                if vv:
+                    names.add(vv)
+    return names
+
+
+def extract_product_recommended(assistant_text: str) -> str:
+    if not assistant_text:
+        return ""
+    if not st.session_state.get("datasets"):
+        return ""
+
+    product_names = _build_product_name_set()
+    if not product_names:
+        return ""
+
+    text_lc = assistant_text.lower()
+
+    # Prefer longest matches first (avoids short name matching inside longer names)
+    for name in sorted(product_names, key=len, reverse=True):
+        if name.lower() in text_lc:
+            return name
+
+    # Fallback: look for "Product:" pattern if present
+    m = re.search(r"(?im)^\s*Product\s*:\s*(.+)\s*$", assistant_text)
+    if m:
+        return m.group(1).strip()
+
+    return ""
+
+
+# -----------------------
+# ✅ MINIMAL ADD: convert batch_df (wide) -> R-friendly long CSV
+# Output columns: conversation_id, llm, llm_label, role, content, product_recommended
+# -----------------------
+def batch_df_to_r_long(df: pd.DataFrame, label_map: Dict[str, str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["conversation_id", "llm", "llm_label", "role", "content", "product_recommended"])
+
+    out_rows = []
+    for _, r in df.iterrows():
+        conv_id = r.get("conversation_id", "")
+        llm = r.get("model", "")
+        llm_label = label_map.get(llm, "")
+
+        msgs = r.get("messages", [])
+        if not isinstance(msgs, list):
+            msgs = []
+
+        # Extract product from assistant message (if exists)
+        assistant_text = ""
+        for m in msgs:
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                assistant_text = m.get("content", "") or ""
+                break
+        prod = extract_product_recommended(assistant_text)
+
+        # Emit one row per message (long format)
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            out_rows.append({
+                "conversation_id": conv_id,
+                "llm": llm,
+                "llm_label": llm_label,
+                "role": m.get("role", ""),
+                "content": m.get("content", ""),
+                "product_recommended": prod if m.get("role") == "assistant" else "",
+            })
+
+    long_df = pd.DataFrame(out_rows)
+
+    # Make it stable column order for R
+    cols = ["conversation_id", "llm", "llm_label", "role", "content", "product_recommended"]
+    for c in cols:
+        if c not in long_df.columns:
+            long_df[c] = ""
+    long_df = long_df[cols]
+
+    return long_df
+
+
 def run_batch_eval(
     api_key: str,
     task: str,
@@ -622,15 +720,20 @@ if st.session_state.batch_df is not None:
     st.caption(f"Last run: {st.session_state.batch_last_run}")
     st.dataframe(st.session_state.batch_df, use_container_width=True)
 
-    csv_bytes = st.session_state.batch_df.to_csv(index=False).encode("utf-8")
+    # ✅ NEW: R-friendly LONG CSV for batch download (keeps JSON unchanged)
+    model_id_to_label = {v: k for k, v in BATCH_MODELS.items()}  # id -> label
+    batch_long_df = batch_df_to_r_long(st.session_state.batch_df, model_id_to_label)
+
+    csv_bytes = batch_long_df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        "⬇️ Download CSV (.csv)",
+        "⬇️ Download CSV (.csv) — R-friendly (LONG)",
         data=csv_bytes,
-        file_name=f"batch_results_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+        file_name=f"batch_results_long_{time.strftime('%Y%m%d_%H%M%S')}.csv",
         mime="text/csv",
         use_container_width=True,
     )
 
+    # JSON output stays the SAME as your original (wide format with messages list)
     json_bytes = json.dumps(
         st.session_state.batch_df.to_dict(orient="records"),
         indent=2,
