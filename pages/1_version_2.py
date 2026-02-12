@@ -1,22 +1,19 @@
-# STREAMLIT APP with RAG EXTENSION + PA6 Batch Runner (Selectable LLMs)
-# ✅ Keeps your original RAG pipeline + structured prompt controls + chat UI
-# ✅ Adds (minimal changes):
-#    1) Batch results include FIRST column: conversation_id = 1,2,3,...
-#    2) After batch run: download BOTH CSV + JSON
-#    3) Batch runner: choose which LLM(s) to run (1, 2, or all 3)
-# ✅ UPDATE: LLM IDs changed to newer models on OpenRouter (GPT-4.1-mini, Claude Sonnet 4.5, Gemini 2.5 Flash)
-
-# ✅ YOUR REQUESTED CHANGES (ONLY):
-# 1) Remove JSON wrapper layer: generated_at / row_count / data
-#    -> JSON output becomes a plain list: [ {...}, {...} ]
-# 2) Change JSON output key from "model_id" -> "model"
-#    -> internal calling still uses model_id variable; only the OUTPUT key is renamed
-# Everything else remains the same.
+# STREAMLIT APP with RAG + Batch Runner
+# ✅ Minimal change: removed Conversation Simulator (Customer Bot)
+# ✅ Keeps: robust embedding fix (case-insensitive + SKU) + embed summary + batch runner + chat UI
+# ✅ Batch CSV download outputs an R-friendly LONG format:
+#    conversation_id, llm, llm_label, role, content, product_recommended
+# ✅ Keeps JSON output unchanged
+# ✅ MINIMAL CHANGE REQUESTED:
+#    Structured Prompt Controls -> ONE box (Prompt Template) containing:
+#    TASK + DATA ACCESS + STYLE + DECISION RULE + OUTPUT RULES
+#    build_system_prompt now takes (prompt_template, rag_context)
 
 import io
 import json
 import time
-from typing import Dict, List
+import re
+from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
@@ -32,7 +29,6 @@ from sentence_transformers import SentenceTransformer
 # -----------------------
 @st.cache_resource
 def get_embed_model():
-    # Force CPU to avoid CUDA/MPS issues on Streamlit Cloud
     return SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
 
 
@@ -53,23 +49,20 @@ def init_state():
     if "vector_db_ready" not in st.session_state:
         st.session_state.vector_db_ready = False
 
-    # ✅ PA6 batch results
     if "batch_df" not in st.session_state:
         st.session_state.batch_df = None
     if "batch_last_run" not in st.session_state:
         st.session_state.batch_last_run = ""
+
+    if "embed_status_lines" not in st.session_state:
+        st.session_state.embed_status_lines = []
 
 
 # -----------------------
 # RAG Functions
 # -----------------------
 def init_vector_db():
-    """
-    Use in-memory Chroma client to avoid Streamlit Cloud persistent DB corruption and
-    embedding-dimension mismatch issues.
-    Each time you upload/load, we rebuild cleanly.
-    """
-    client = chromadb.Client()  # ✅ in-memory
+    client = chromadb.Client()  # in-memory
     st.session_state.vector_db = client.get_or_create_collection(name="odi-grips")
     st.session_state.vector_db_ready = True
 
@@ -79,66 +72,63 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     return model.encode(texts).tolist()
 
 
+# ✅ robust card builder (case-insensitive + includes SKU + never empty unless row truly empty)
 def _row_to_product_card(row: pd.Series) -> str:
-    """
-    Product card formatting for embeddings + retrieval.
-    IMPORTANT: includes colors so color queries (e.g., purple) can be retrieved.
-    """
-    name_key_candidates = ["product_name", "name", "title", "Product", "Product Name"]
-    prod_name = None
-    for k in name_key_candidates:
-        if k in row.index and pd.notna(row[k]):
-            prod_name = str(row[k]).strip()
-            break
+    row_dict = {}
+    for k, v in row.items():
+        kk = str(k).strip()
+        vv = "" if v is None else str(v).strip()
+        row_dict[kk] = vv
+        row_dict[kk.lower()] = vv
 
-    preferred_keys = [
-        "category", "Category",
-        "riding_style", "Riding Style",
-        "locking_mechanism", "Locking Mechanism",
-        "Grip Attachment System", "grip attachment system",
-        "thickness", "Thickness",
-        "damping_level", "Damping Level",
-        "durability", "Durability",
-        "grip_pattern", "Grip Pattern",
-        "pattern", "Pattern",
-        "Feel", "feel",
-        "traction", "Traction",
-        "price", "Price",
-        "ergonomics", "Ergonomics",
-        "key_features", "Key Features",
-        "differentiator", "Differentiator",
-        "co_branding", "Co Branding",
-        "Length", "length",
-        # ✅ colors included
-        "colors", "Colors",
-        "color", "Color",
-        "description", "Description",
-        "notes", "Notes",
-        "url", "URL", "link", "Link",
+    def get_val(*keys: str) -> str:
+        for key in keys:
+            if key in row_dict and row_dict[key].strip() != "":
+                return row_dict[key].strip()
+            lk = key.lower()
+            if lk in row_dict and row_dict[lk].strip() != "":
+                return row_dict[lk].strip()
+        return ""
+
+    sku = get_val("sku", "SKU")
+    product_name = get_val("product_name", "Product Name", "product", "Product", "name", "Name", "title", "Title")
+
+    preferred_fields = [
+        ("SKU", ["sku", "SKU"]),
+        ("Product Name", ["product_name", "Product Name"]),
+        ("Category", ["category", "Category"]),
+        ("Riding Style", ["riding_style", "Riding Style"]),
+        ("Length (mm)", ["length_mm", "Length (mm)"]),
+        ("Diameter (mm)", ["diameter_mm", "Diameter (mm)"]),
+        ("Thickness Category", ["thickness_category", "Thickness Category"]),
+        ("Colors", ["colors", "Colors"]),
+        ("Locking Mechanism", ["locking_mechanism", "Locking Mechanism"]),
+        ("Damping Level", ["damping_level", "Damping Level"]),
+        ("Vibration Reduction", ["vibration_reduction", "Vibration Reduction"]),
+        ("Grip Pattern", ["grip_pattern", "Grip Pattern"]),
+        ("Price", ["price", "Price"]),
     ]
 
     lines = []
-    if prod_name:
-        lines.append(f"Product: {prod_name}")
 
-    for k in preferred_keys:
-        if k in row.index and pd.notna(row[k]):
-            val = str(row[k]).strip()
-            if val:
-                label = str(k).replace("_", " ").title()
-                lines.append(f"{label}: {val}")
+    if product_name:
+        lines.append(f"Product: {product_name}")
+    elif sku:
+        lines.append(f"Product: {sku}")
 
-    if len(lines) <= 1:
+    for label, keys in preferred_fields:
+        val = get_val(*keys)
+        if val:
+            lines.append(f"{label}: {val}")
+
+    if len(lines) == 0:
         extras = []
-        for k, v in row.items():
-            if pd.isna(v):
+        for k, v in row_dict.items():
+            if k != k.lower():
                 continue
-            if str(k) in preferred_keys:
-                continue
-            vv = str(v).strip()
-            if vv:
-                extras.append(f"{str(k)}: {vv}")
-            if len(extras) >= 8:
+            if v.strip():
+                extras.append(f"{k}: {v.strip()}")
+            if len(extras) >= 12:
                 break
         if extras:
             lines.append("Other:")
@@ -160,21 +150,33 @@ def add_to_vector_db():
         pass
 
     all_texts, ids, metadata = [], [], []
+    total_rows = 0
+    skipped_existing = 0
+    skipped_truly_empty = 0
 
     for fname, df in st.session_state.datasets.items():
         df = df.reset_index(drop=True)
+        total_rows += len(df)
+
         for i, row in df.iterrows():
             chunk_id = f"{fname}::row-{i}"
             if chunk_id in existing_ids:
+                skipped_existing += 1
                 continue
 
             card = _row_to_product_card(row)
-            if not card:
+            if not card.strip():
+                skipped_truly_empty += 1
                 continue
 
             all_texts.append(card)
             ids.append(chunk_id)
             metadata.append({"source": fname, "row_index": int(i)})
+
+    st.info(
+        f"Loaded rows: {total_rows} | Embedded: {len(all_texts)} | "
+        f"Skipped existing: {skipped_existing} | Skipped empty rows: {skipped_truly_empty}"
+    )
 
     if not all_texts:
         st.info("No rows to embed (empty dataset).")
@@ -213,139 +215,46 @@ def rag_retrieve_context(query: str, top_k: int = 5) -> str:
 
 
 # -----------------------
-# Defaults (Structured Prompts)
+# ✅ Structured Prompt Template — ONE BOX
 # -----------------------
-DEFAULT_TASK = (
-    "You are an expert ODI grip specialist helping users of all levels—beginner to expert—"
-    "choose the most suitable grip from ODI's product range based strictly on the uploaded CSV dataset. "
-    "Your job is to recommend the best grip for their specific riding style, comfort needs, hand size, and skill level."
-)
+DEFAULT_PROMPT_TEMPLATE = """<TASK>
+You are an expert ODI grip specialist. Recommend the most suitable ODI grip based strictly on the uploaded CSV dataset and the retrieved RAG context.
 
-DEFAULT_PERSONA = (
-    "The user may be a beginner or an experienced rider. Use simple, clear explanations for beginners "
-    "(avoid technical jargon), and use more technical language if the user shows expertise or uses advanced terms. "
-    "Always adapt based on how they describe their needs."
-)
+<DATA ACCESS (STRICT)>
+- Use ONLY information retrieved from the embedded ODI product dataset (RAG context).
+- Do NOT browse the web or use external reviews/knowledge.
+- Do NOT invent specs, pricing, availability, or claims not shown in the retrieved context.
+- Only ODI grips are allowed (no competitor brands).
+- If the retrieved context lacks what you need, say so and ask ONE clarifying question.
 
-DEFAULT_TONE = (
-    "Respond in a professional, supportive, and informative tone—similar to a knowledgeable customer service expert "
-    "in a high-end bike shop. Encourage beginners and build trust with experienced riders."
-)
+<STYLE (PERSONA + TONE)>
+Respond in a professional, supportive, and informative tone—similar to a knowledgeable customer service expert in a high-end bike shop.
+Encourage beginners and build trust with experienced riders.
 
-DEFAULT_DATA_RULES = """DATA RULES (STRICT):
-- Use ONLY information retrieved from the embedded ODI product dataset.
-- Do NOT browse the web, cite webpages, or use external reviews/knowledge.
-- Do NOT invent features, prices, specs, availability, or “best overall” claims.
-- If a detail is not in the retrieved context, say you’re not sure and ask a clarifying question instead.
-- Only ODI grips are allowed. Never recommend competitor brands.
-- Always recommend at least one specific product name from the retrieved context if a match is found.
-- If the user mentions a color (e.g., purple), prioritize products whose Colors include that color in the retrieved context.
-"""
+Language Simplicity Rule:
+- Default to simple, everyday language (target ~5th–6th grade reading level).
+- Prefer short sentences (under ~15 words).
+- Avoid filler phrases (e.g., “I understand that…”, “it can be challenging to…”).
+- Replace multi-syllable or formal words with simpler alternatives when possible.
+- Only use technical terms if the user uses them first.
 
-DEFAULT_SCOPE = """SCOPE:
-This assistant supports ALL ODI grips in the dataset (e.g., MTB, BMX, Moto, Urban/Casual).
-If the user asks about a category not supported, explain the limitation and ask follow-up.
-Identify the riding category early (MTB vs BMX vs Moto vs Casual) because it strongly affects which grips fit.
-"""
+<DECISION RULE>
+- Recommend EXACTLY ONE product.
+- Only recommend when the match is strongly supported by retrieved context.
+- If the match is weak or ambiguous, ask ONE clarifying question instead.
 
-DEFAULT_PREF_SCHEMA = """PREFERENCES (ONLY THESE AFFECT RECOMMENDATIONS):
-
-Keys:
-- riding_style
-- locking_mechanism
-- thickness
-- damping_level
-- durability
-
-Allowed values:
-riding_style: trail, enduro, downhill, cross-country, bmx, moto, urban, casual
-locking_mechanism: lock-on, slip-on
-thickness: thin, medium, thick, medium-thick size xl
-damping_level: low, medium, high
-durability: low, medium, high
-
-Rules:
-- Only set a preference if the user clearly indicates it.
-- If unclear, leave it unset and ask ONE follow-up question.
-"""
-
-DEFAULT_MAPPING = """MAPPING HINTS (use only when intent is clear): 
-riding_style: 
-- “BMX / park / street tricks” -> bmx 
-- “Rocky trails / mixed terrain / all-mountain” -> trail 
-- “Enduro / aggressive trail / rough descents” -> enduro 
-- “Downhill / bike park / steep fast” -> downhill 
-- “XC / racing / long climbs” -> cross-country 
-- “Moto” -> moto 
-- “Commuting / city rides” -> urban 
-- “Casual cruising / e-bike comfort” -> casual 
-
-thickness: 
-- “small hands / slim / skinny” -> thin 
-- “chunky / fat / big / extra padding” -> thick 
-- “large hands / XL gloves” -> medium-thick size xl (only if user indicates XL/very large hands) 
-
-damping_level: 
-- “hands numb / vibration / shock absorption / rocky” -> high 
-- “balanced” -> medium 
-- “more trail feel / firm” -> low 
-
-locking_mechanism: 
-- “lock-on / clamps” -> lock-on 
-- “slip-on / push-on” -> slip-on 
-
-durability: 
-- “long-lasting / hard riding / abrasive trails” -> high
-"""
-
-DEFAULT_WORKFLOW = """WORKFLOW:
-1) Welcome the user and ask what they ride + what problem they want to solve (comfort, control, numbness, hand size, etc.). 
-2) Identify riding_style early if possible.
-3) Ask ONE focused follow-up question at a time to fill missing preferences.
-4) Once enough preferences are collected, recommend grips based ONLY on the dataset.
-5) Briefly explain why the suggested grips match the stated preferences, without adding unsupported details.
-"""
-
-DEFAULT_OUTPUT_RULES = """RESPONSE FORMAT:
-- Replies = 2–6 sentences
-- Include:
-  (a) acknowledgment
-  (b) recommendation (include at least one named product when available)
-  (c) one follow-up if needed
-- Avoid long lists or multiple follow-ups
-"""
+<OUTPUT RULES>
+- Recommend ONE primary product.
+- Briefly explain why the match fits the identified needs.
+- Use exact product_name.
+""".strip()
 
 
-def build_system_prompt(task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, rag_context):
+def build_system_prompt(prompt_template: str, rag_context: str) -> str:
     return f"""
-[Task Definition]
-{task}
+{prompt_template}
 
-[Customer Persona]
-{persona}
-
-[Tone & Language Style]
-{tone}
-
-[Data Access & Grounding Rules]
-{data_rules}
-
-[Scope & Category Handling]
-{scope}
-
-[Preference Schema]
-{pref_schema}
-
-[Mapping Guide]
-{mapping_guide}
-
-[Conversation Workflow]
-{workflow}
-
-[Output Format Rules]
-{output_rules}
-
-[RAG Context Retrieved for this Query]
+<RAG Context Retrieved for this Query>
 {rag_context}
 
 IMPORTANT:
@@ -389,9 +298,8 @@ def call_llm_openrouter(
 
 
 # -----------------------
-# PA6 Batch Runner Helpers (Selectable LLMs)
+# Batch Runner Helpers (Selectable LLMs)
 # -----------------------
-# ✅ Updated to newer OpenRouter models
 BATCH_MODELS = {
     "GPT (OpenAI) — GPT-4.1 Mini": "openai/gpt-4.1-mini",
     "Claude (Anthropic) — Claude Sonnet 4.5": "anthropic/claude-sonnet-4.5",
@@ -414,17 +322,95 @@ def safe_call_one(
         return f"ERROR: {e}"
 
 
+# -----------------------
+# helper: extract product recommendation from assistant text
+# -----------------------
+def _build_product_name_set() -> set:
+    names = set()
+    for _fname, _df in st.session_state.datasets.items():
+        cols_lc = [c.lower() for c in _df.columns]
+        if "product_name" in cols_lc:
+            col = _df.columns[cols_lc.index("product_name")]
+            for v in _df[col].astype(str).fillna("").tolist():
+                vv = v.strip()
+                if vv:
+                    names.add(vv)
+    return names
+
+
+def extract_product_recommended(assistant_text: str) -> str:
+    if not assistant_text:
+        return ""
+    if not st.session_state.get("datasets"):
+        return ""
+
+    product_names = _build_product_name_set()
+    if not product_names:
+        return ""
+
+    text_lc = assistant_text.lower()
+
+    for name in sorted(product_names, key=len, reverse=True):
+        if name.lower() in text_lc:
+            return name
+
+    m = re.search(r"(?im)^\s*Product\s*:\s*(.+)\s*$", assistant_text)
+    if m:
+        return m.group(1).strip()
+
+    return ""
+
+
+# -----------------------
+# convert batch_df (wide) -> R-friendly long CSV
+# -----------------------
+def batch_df_to_r_long(df: pd.DataFrame, label_map: Dict[str, str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["conversation_id", "llm", "llm_label", "role", "content", "product_recommended"])
+
+    out_rows = []
+    for _, r in df.iterrows():
+        conv_id = r.get("conversation_id", "")
+        llm = r.get("model", "")
+        llm_label = label_map.get(llm, "")
+
+        msgs = r.get("messages", [])
+        if not isinstance(msgs, list):
+            msgs = []
+
+        assistant_text = ""
+        for m in msgs:
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                assistant_text = m.get("content", "") or ""
+                break
+        prod = extract_product_recommended(assistant_text)
+
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            out_rows.append({
+                "conversation_id": conv_id,
+                "llm": llm,
+                "llm_label": llm_label,
+                "role": m.get("role", ""),
+                "content": m.get("content", ""),
+                "product_recommended": prod if m.get("role") == "assistant" else "",
+            })
+
+    long_df = pd.DataFrame(out_rows)
+
+    cols = ["conversation_id", "llm", "llm_label", "role", "content", "product_recommended"]
+    for c in cols:
+        if c not in long_df.columns:
+            long_df[c] = ""
+    long_df = long_df[cols]
+
+    return long_df
+
+
 def run_batch_eval(
     api_key: str,
-    task: str,
-    persona: str,
-    tone: str,
-    data_rules: str,
-    scope: str,
-    pref_schema: str,
-    mapping_guide: str,
-    workflow: str,
-    output_rules: str,
+    prompt_template: str,
     questions: List[str],
     selected_models: Dict[str, str],
     top_k: int = 5,
@@ -439,11 +425,8 @@ def run_batch_eval(
 
     for idx, q in enumerate(questions, start=1):
         rag_context = rag_retrieve_context(q, top_k=top_k)
-        sys_prompt = build_system_prompt(
-            task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, rag_context
-        )
+        sys_prompt = build_system_prompt(prompt_template, rag_context)
 
-        # ✅ LONG format: one row per (question, model)
         for label, model_id in model_items:
             ans = safe_call_one(
                 api_key=api_key,
@@ -454,7 +437,6 @@ def run_batch_eval(
                 max_tokens=max_tokens,
             )
 
-            # ✅ ONLY CHANGE: output key "model" (not model_id)
             rows.append({
                 "conversation_id": idx,
                 "model": model_id,
@@ -468,11 +450,8 @@ def run_batch_eval(
             prog.progress(min(1.0, done / total_calls))
 
     df = pd.DataFrame(rows)
-
-    # Ensure conversation_id is first column
     if not df.empty and "conversation_id" in df.columns:
         df = df[["conversation_id"] + [c for c in df.columns if c != "conversation_id"]]
-
     return df
 
 
@@ -496,7 +475,7 @@ with st.sidebar:
     st.header("LLM Settings")
     api_key = st.text_input("OpenRouter API Key", type="password")
 
-    model_choice = st.selectbox("Choose LLM (Chat mode)", list(MODEL_PRESETS.keys()), index=0)
+    model_choice = st.selectbox("Chat LLM (Single Chat Mode)", list(MODEL_PRESETS.keys()), index=0)
     if MODEL_PRESETS[model_choice] == "__custom__":
         model = st.text_input("Model (OpenRouter ID)", value="openai/gpt-4.1-mini")
     else:
@@ -504,6 +483,12 @@ with st.sidebar:
         st.caption(f"Using model: `{model}`")
 
     show_debug = st.checkbox("Show RAG Debug (retrieved context)", value=False)
+
+if show_debug and st.session_state.datasets:
+    st.sidebar.markdown("### ✅ Loaded CSV Columns")
+    for fname, df in st.session_state.datasets.items():
+        st.sidebar.write(fname)
+        st.sidebar.write(list(df.columns))
 
 st.subheader("📁 Upload CSV Files")
 csv_files = st.file_uploader("Upload ODI product CSVs", type=["csv"], accept_multiple_files=True)
@@ -515,34 +500,54 @@ if st.button("🔄 Load & Embed CSVs"):
 
     st.session_state.datasets = {}
     for f in csv_files:
-        df = pd.read_csv(f)
-        df.columns = [c.strip() for c in df.columns]
+        df = pd.read_csv(
+            f,
+            dtype=str,
+            engine="python",
+            keep_default_na=False
+        )
+        df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
+        df = df.fillna("")
         st.session_state.datasets[f.name] = df
 
+    st.session_state.embed_status_lines = []
     add_to_vector_db()
-    st.success("CSV files loaded. Vector index rebuilt for RAG.")
 
-    if show_debug and st.session_state.datasets:
-        st.sidebar.markdown("### ✅ Loaded CSV Columns")
-        for fname, df in st.session_state.datasets.items():
-            st.sidebar.write(fname)
-            st.sidebar.write(list(df.columns))
+    st.session_state.embed_status_lines.append("✅ CSV files loaded. Vector index rebuilt for RAG.")
 
+    target_full = "vanquish lock-on grips"
+    target_short = "vanquish"
+
+    combined_text = ""
+    for _fname, _df in st.session_state.datasets.items():
+        combined_text += " " + " ".join(_df.astype(str).fillna("").values.flatten())
+
+    combined_text_lc = combined_text.lower()
+
+    if (target_full not in combined_text_lc) and (target_short not in combined_text_lc):
+        msg = "❌ Sanity Check Failed: 'Vanquish Lock-On Grips' (or 'Vanquish') not found in loaded CSVs BEFORE embeddings."
+        st.session_state.embed_status_lines.append(msg)
+        st.error(msg)
+        st.stop()
+    else:
+        st.session_state.embed_status_lines.append("✅ Sanity Check Passed: Vanquish found in loaded CSVs (pre-embedding).")
+
+if st.session_state.get("embed_status_lines"):
+    for line in st.session_state.embed_status_lines:
+        if line.startswith("❌"):
+            st.error(line)
+        else:
+            st.success(line)
+
+# -----------------------
+# ✅ ONE-box Prompt Controls
+# -----------------------
 with st.expander("🧠 Structured Prompt Controls", expanded=True):
-    st.subheader("Prompt Settings")
-    task = st.text_area("Task", value=DEFAULT_TASK)
-    persona = st.text_area("Persona", value=DEFAULT_PERSONA)
-    tone = st.text_area("Tone", value=DEFAULT_TONE)
-    data_rules = st.text_area("Data Rules", value=DEFAULT_DATA_RULES)
-    scope = st.text_area("Scope", value=DEFAULT_SCOPE)
-    pref_schema = st.text_area("Preferences", value=DEFAULT_PREF_SCHEMA)
-    mapping_guide = st.text_area("Mapping", value=DEFAULT_MAPPING)
-    workflow = st.text_area("Workflow", value=DEFAULT_WORKFLOW)
-    output_rules = st.text_area("Format Rules", value=DEFAULT_OUTPUT_RULES)
+    st.subheader("Prompt Template (single box)")
+    prompt_template = st.text_area("Prompt Template", value=DEFAULT_PROMPT_TEMPLATE, height=420)
 
 st.subheader("Actions")
-a1, a2, a3 = st.columns(3)
-
+a1 = st.columns(1)[0]
 with a1:
     if st.button("✅ Confirm LLM Setup", use_container_width=True):
         if not api_key:
@@ -560,35 +565,14 @@ with a1:
                 st.session_state.llm_confirmed = False
                 st.session_state.last_confirm_result = f"Error: {e}"
 
-with a2:
-    if st.button("🧹 Clear Chat History", use_container_width=True):
-        st.session_state.chat = []
-        st.toast("Chat history cleared.")
-
-with a3:
-    def transcript_json():
-        return json.dumps(
-            {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "messages": st.session_state.chat},
-            indent=2,
-            ensure_ascii=False,
-        )
-
-    st.download_button(
-        "⬇️ Download Transcript",
-        data=transcript_json().encode("utf-8"),
-        file_name="odi_chat_transcript.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-
 if st.session_state.last_confirm_result:
     st.info(st.session_state.last_confirm_result)
 
 # -----------------------
-# ✅ PA6 Batch Evaluation Section
+# Batch Evaluation Section
 # -----------------------
 st.divider()
-st.header("📊 PA6 Batch Evaluation (Run Questions × Selectable LLMs)")
+st.header("📊 Batch Evaluation (Run Questions × Selectable LLMs)")
 
 colA, colB = st.columns([2, 1])
 with colA:
@@ -598,7 +582,7 @@ with colA:
         placeholder="Question 1...\nQuestion 2...\n..."
     )
 with colB:
-    top_k = st.number_input("RAG top_k", min_value=1, max_value=15, value=5, step=1)
+    top_k = st.number_input("RAG top_k", min_value=1, max_value=15, value=15, step=1)
     batch_temp = st.slider("Batch temperature", min_value=0.0, max_value=1.0, value=0.2, step=0.05)
     batch_max_tokens = st.number_input("Batch max_tokens", min_value=100, max_value=2000, value=600, step=50)
     include_context_col = st.checkbox("Include rag_context column in downloads", value=True)
@@ -625,8 +609,7 @@ if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
         with st.spinner("Running batch… this will call the selected model(s) for each question."):
             df = run_batch_eval(
                 api_key=api_key,
-                task=task, persona=persona, tone=tone, data_rules=data_rules, scope=scope,
-                pref_schema=pref_schema, mapping_guide=mapping_guide, workflow=workflow, output_rules=output_rules,
+                prompt_template=prompt_template,
                 questions=questions,
                 selected_models=selected_models,
                 top_k=int(top_k),
@@ -637,10 +620,6 @@ if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
         if not include_context_col and "rag_context" in df.columns:
             df = df.drop(columns=["rag_context"])
 
-        # Ensure conversation_id is still first
-        if not df.empty and "conversation_id" in df.columns:
-            df = df[["conversation_id"] + [c for c in df.columns if c != "conversation_id"]]
-
         st.session_state.batch_df = df
         st.session_state.batch_last_run = time.strftime("%Y-%m-%d %H:%M:%S")
         st.success(f"Batch finished at {st.session_state.batch_last_run}. Rows: {len(df)}")
@@ -650,17 +629,18 @@ if st.session_state.batch_df is not None:
     st.caption(f"Last run: {st.session_state.batch_last_run}")
     st.dataframe(st.session_state.batch_df, use_container_width=True)
 
-    csv_bytes = st.session_state.batch_df.to_csv(index=False).encode("utf-8")
+    model_id_to_label = {v: k for k, v in BATCH_MODELS.items()}  # id -> label
+    batch_long_df = batch_df_to_r_long(st.session_state.batch_df, model_id_to_label)
+
+    csv_bytes = batch_long_df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        "⬇️ Download CSV (.csv)",
+        "⬇️ Download CSV (.csv) — R-friendly (LONG)",
         data=csv_bytes,
-        file_name=f"pa6_batch_results_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+        file_name=f"batch_results_long_{time.strftime('%Y%m%d_%H%M%S')}.csv",
         mime="text/csv",
         use_container_width=True,
     )
 
-    # ✅ CHANGE 1: remove wrapper generated_at/row_count/data
-    # ✅ CHANGE 2: keep JSON as plain list records
     json_bytes = json.dumps(
         st.session_state.batch_df.to_dict(orient="records"),
         indent=2,
@@ -670,16 +650,38 @@ if st.session_state.batch_df is not None:
     st.download_button(
         "⬇️ Download JSON (.json)",
         data=json_bytes,
-        file_name=f"pa6_batch_results_{time.strftime('%Y%m%d_%H%M%S')}.json",
+        file_name=f"batch_results_{time.strftime('%Y%m%d_%H%M%S')}.json",
         mime="application/json",
         use_container_width=True,
     )
 
 # -----------------------
-# Chat UI (unchanged)
+# Chat UI
 # -----------------------
 st.divider()
 st.header("💬 Chat (Single LLM)")
+
+chat_a1, chat_a2 = st.columns(2)
+with chat_a1:
+    if st.button("🧹 Clear Chat History", use_container_width=True):
+        st.session_state.chat = []
+        st.toast("Chat history cleared.")
+
+with chat_a2:
+    def transcript_json():
+        return json.dumps(
+            [{"conversation_id": 1, "model": model, "messages": st.session_state.chat}],
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    st.download_button(
+        "⬇️ Download Transcript",
+        data=transcript_json().encode("utf-8"),
+        file_name="chat_transcript.json",
+        mime="application/json",
+        use_container_width=True,
+    )
 
 for m in st.session_state.chat:
     with st.chat_message(m["role"]):
@@ -691,15 +693,14 @@ if user_msg:
     with st.chat_message("user"):
         st.markdown(user_msg)
 
-    context = rag_retrieve_context(user_msg)
+    st.caption(f"Single Chat RAG top_k = {int(top_k)}")
+    context = rag_retrieve_context(user_msg, top_k=int(top_k))
 
     if show_debug:
         with st.expander("🔎 Retrieved RAG Context (Debug)", expanded=True):
             st.text(context)
 
-    sys_prompt = build_system_prompt(
-        task, persona, tone, data_rules, scope, pref_schema, mapping_guide, workflow, output_rules, context
-    )
+    sys_prompt = build_system_prompt(prompt_template, context)
 
     with st.chat_message("assistant"):
         try:
