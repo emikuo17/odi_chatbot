@@ -4,10 +4,11 @@
 # ✅ Batch CSV download outputs an R-friendly LONG format:
 #    conversation_id, llm, llm_label, role, content, product_recommended
 # ✅ Keeps JSON output unchanged
-# ✅ MINIMAL CHANGE REQUESTED:
-#    Structured Prompt Controls -> ONE box (Prompt Template) containing:
-#    TASK + DATA ACCESS + STYLE + DECISION RULE + OUTPUT RULES
-#    build_system_prompt now takes (prompt_template, rag_context)
+# ✅ MINIMAL CHANGE REQUESTED (THIS EDIT):
+#    - Structured Prompt Controls = 5 boxes:
+#        Task, Data Access (Strict), Style (Persona + Tone), Decision Rule, Output Rules
+#    - Sidebar/labels: "Structured Prompt Controls" and "Prompt Settings" wording
+#    - build_system_prompt now composes from the 5 boxes
 
 import io
 import json
@@ -215,19 +216,21 @@ def rag_retrieve_context(query: str, top_k: int = 5) -> str:
 
 
 # -----------------------
-# ✅ Structured Prompt Template — ONE BOX
+# ✅ Defaults (Structured Prompts) — NOW 5 BOXES
 # -----------------------
-DEFAULT_PROMPT_TEMPLATE = """<TASK>
+DEFAULT_TASK = """<TASK>
 You are an expert ODI grip specialist. Recommend the most suitable ODI grip based strictly on the uploaded CSV dataset and the retrieved RAG context.
+""".strip()
 
-<DATA ACCESS (STRICT)>
+DEFAULT_DATA_RULES = """<DATA ACCESS (STRICT)>
 - Use ONLY information retrieved from the embedded ODI product dataset (RAG context).
 - Do NOT browse the web or use external reviews/knowledge.
 - Do NOT invent specs, pricing, availability, or claims not shown in the retrieved context.
 - Only ODI grips are allowed (no competitor brands).
 - If the retrieved context lacks what you need, say so and ask ONE clarifying question.
+""".strip()
 
-<STYLE (PERSONA + TONE)>
+DEFAULT_STYLE = """<STYLE (PERSONA + TONE)>
 Respond in a professional, supportive, and informative tone—similar to a knowledgeable customer service expert in a high-end bike shop.
 Encourage beginners and build trust with experienced riders.
 
@@ -237,22 +240,39 @@ Language Simplicity Rule:
 - Avoid filler phrases (e.g., “I understand that…”, “it can be challenging to…”).
 - Replace multi-syllable or formal words with simpler alternatives when possible.
 - Only use technical terms if the user uses them first.
+""".strip()
 
-<DECISION RULE>
+DEFAULT_DECISION_RULE = """<DECISION RULE>
 - Recommend EXACTLY ONE product.
 - Only recommend when the match is strongly supported by retrieved context.
 - If the match is weak or ambiguous, ask ONE clarifying question instead.
+""".strip()
 
-<OUTPUT RULES>
+DEFAULT_OUTPUT_RULES = """<OUTPUT RULES>
 - Recommend ONE primary product.
 - Briefly explain why the match fits the identified needs.
 - Use exact product_name.
 """.strip()
 
 
-def build_system_prompt(prompt_template: str, rag_context: str) -> str:
+def build_system_prompt(
+    task: str,
+    data_rules: str,
+    style: str,
+    decision_rule: str,
+    output_rules: str,
+    rag_context: str
+) -> str:
     return f"""
-{prompt_template}
+{task}
+
+{data_rules}
+
+{style}
+
+{decision_rule}
+
+{output_rules}
 
 <RAG Context Retrieved for this Query>
 {rag_context}
@@ -410,7 +430,11 @@ def batch_df_to_r_long(df: pd.DataFrame, label_map: Dict[str, str]) -> pd.DataFr
 
 def run_batch_eval(
     api_key: str,
-    prompt_template: str,
+    task: str,
+    data_rules: str,
+    style: str,
+    decision_rule: str,
+    output_rules: str,
     questions: List[str],
     selected_models: Dict[str, str],
     top_k: int = 5,
@@ -425,7 +449,7 @@ def run_batch_eval(
 
     for idx, q in enumerate(questions, start=1):
         rag_context = rag_retrieve_context(q, top_k=top_k)
-        sys_prompt = build_system_prompt(prompt_template, rag_context)
+        sys_prompt = build_system_prompt(task, data_rules, style, decision_rule, output_rules, rag_context)
 
         for label, model_id in model_items:
             ans = safe_call_one(
@@ -539,12 +563,14 @@ if st.session_state.get("embed_status_lines"):
         else:
             st.success(line)
 
-# -----------------------
-# ✅ ONE-box Prompt Controls
-# -----------------------
+# ✅ Rename expander title and inner label wording as requested
 with st.expander("🧠 Structured Prompt Controls", expanded=True):
-    st.subheader("Prompt Template (single box)")
-    prompt_template = st.text_area("Prompt Template", value=DEFAULT_PROMPT_TEMPLATE, height=420)
+    st.subheader("Prompt Settings")
+    task = st.text_area("Task", value=DEFAULT_TASK, height=90)
+    data_rules = st.text_area("Data Access (Strict)", value=DEFAULT_DATA_RULES, height=140)
+    style = st.text_area("Style (Persona + Tone)", value=DEFAULT_STYLE, height=210)
+    decision_rule = st.text_area("Decision Rule", value=DEFAULT_DECISION_RULE, height=110)
+    output_rules = st.text_area("Output Rules", value=DEFAULT_OUTPUT_RULES, height=100)
 
 st.subheader("Actions")
 a1 = st.columns(1)[0]
@@ -609,7 +635,11 @@ if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
         with st.spinner("Running batch… this will call the selected model(s) for each question."):
             df = run_batch_eval(
                 api_key=api_key,
-                prompt_template=prompt_template,
+                task=task,
+                data_rules=data_rules,
+                style=style,
+                decision_rule=decision_rule,
+                output_rules=output_rules,
                 questions=questions,
                 selected_models=selected_models,
                 top_k=int(top_k),
@@ -700,7 +730,7 @@ if user_msg:
         with st.expander("🔎 Retrieved RAG Context (Debug)", expanded=True):
             st.text(context)
 
-    sys_prompt = build_system_prompt(prompt_template, context)
+    sys_prompt = build_system_prompt(task, data_rules, style, decision_rule, output_rules, context)
 
     with st.chat_message("assistant"):
         try:
