@@ -1,8 +1,14 @@
 # STREAMLIT APP with RAG + Batch Runner
-# ✅ Minimal change: batch now runs BOTH Prompt A and Prompt B
-#    Loop: question -> model -> prompt_id in {A,B}
-# ✅ Saves prompt_id in batch results (wide + long CSV)
-# ✅ Keeps JSON download (now includes prompt_id too)
+# ✅ Minimal change: removed Conversation Simulator (Customer Bot)
+# ✅ Keeps: robust embedding fix (case-insensitive + SKU) + embed summary + batch runner + chat UI
+# ✅ Batch CSV download outputs an R-friendly LONG format:
+#    conversation_id, llm, llm_label, role, content, product_recommended
+# ✅ Keeps JSON output unchanged
+# ✅ MINIMAL CHANGE REQUESTED (THIS EDIT):
+#    - Structured Prompt Controls = 5 boxes:
+#        Task, Data Access (Strict), Style (Persona + Tone), Decision Rule, Output Rules
+#    - Sidebar/labels: "Structured Prompt Controls" and "Prompt Settings" wording
+#    - build_system_prompt now composes from the 5 boxes
 
 import io
 import json
@@ -105,6 +111,7 @@ def _row_to_product_card(row: pd.Series) -> str:
     ]
 
     lines = []
+
     if product_name:
         lines.append(f"Product: {product_name}")
     elif sku:
@@ -209,7 +216,7 @@ def rag_retrieve_context(query: str, top_k: int = 5) -> str:
 
 
 # -----------------------
-# Defaults (5 boxes)
+# ✅ Defaults (Structured Prompts) — NOW 5 BOXES
 # -----------------------
 DEFAULT_TASK = """<TASK>
 You are an expert ODI grip specialist. Recommend the most suitable ODI grip based strictly on the uploaded CSV dataset and the retrieved RAG context.
@@ -311,7 +318,7 @@ def call_llm_openrouter(
 
 
 # -----------------------
-# Batch Runner Helpers
+# Batch Runner Helpers (Selectable LLMs)
 # -----------------------
 BATCH_MODELS = {
     "GPT (OpenAI) — GPT-4.1 Mini": "openai/gpt-4.1-mini",
@@ -376,17 +383,14 @@ def extract_product_recommended(assistant_text: str) -> str:
 
 # -----------------------
 # convert batch_df (wide) -> R-friendly long CSV
-# ✅ now includes prompt_id column
 # -----------------------
 def batch_df_to_r_long(df: pd.DataFrame, label_map: Dict[str, str]) -> pd.DataFrame:
-    cols = ["conversation_id", "prompt_id", "llm", "llm_label", "role", "content", "product_recommended"]
     if df is None or df.empty:
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=["conversation_id", "llm", "llm_label", "role", "content", "product_recommended"])
 
     out_rows = []
     for _, r in df.iterrows():
         conv_id = r.get("conversation_id", "")
-        prompt_id = r.get("prompt_id", "")
         llm = r.get("model", "")
         llm_label = label_map.get(llm, "")
 
@@ -406,7 +410,6 @@ def batch_df_to_r_long(df: pd.DataFrame, label_map: Dict[str, str]) -> pd.DataFr
                 continue
             out_rows.append({
                 "conversation_id": conv_id,
-                "prompt_id": prompt_id,
                 "llm": llm,
                 "llm_label": llm_label,
                 "role": m.get("role", ""),
@@ -415,18 +418,23 @@ def batch_df_to_r_long(df: pd.DataFrame, label_map: Dict[str, str]) -> pd.DataFr
             })
 
     long_df = pd.DataFrame(out_rows)
+
+    cols = ["conversation_id", "llm", "llm_label", "role", "content", "product_recommended"]
     for c in cols:
         if c not in long_df.columns:
             long_df[c] = ""
-    return long_df[cols]
+    long_df = long_df[cols]
+
+    return long_df
 
 
-# -----------------------
-# ✅ MINIMAL CHANGE: run_batch_eval now loops prompt_id in {A,B}
-# -----------------------
 def run_batch_eval(
     api_key: str,
-    prompts: Dict[str, Dict[str, str]],  # {"A":{...}, "B":{...}}
+    task: str,
+    data_rules: str,
+    style: str,
+    decision_rule: str,
+    output_rules: str,
     questions: List[str],
     selected_models: Dict[str, str],
     top_k: int = 5,
@@ -435,47 +443,35 @@ def run_batch_eval(
 ) -> pd.DataFrame:
     rows = []
     model_items = list(selected_models.items())
-    prompt_items = list(prompts.items())
-
-    total_calls = max(1, len(questions) * len(model_items) * len(prompt_items))
+    total_calls = max(1, len(questions) * len(model_items))
     done = 0
     prog = st.progress(0)
 
     for idx, q in enumerate(questions, start=1):
         rag_context = rag_retrieve_context(q, top_k=top_k)
+        sys_prompt = build_system_prompt(task, data_rules, style, decision_rule, output_rules, rag_context)
 
         for label, model_id in model_items:
-            for prompt_id, p in prompt_items:
-                sys_prompt = build_system_prompt(
-                    task=p["task"],
-                    data_rules=p["data_rules"],
-                    style=p["style"],
-                    decision_rule=p["decision_rule"],
-                    output_rules=p["output_rules"],
-                    rag_context=rag_context
-                )
+            ans = safe_call_one(
+                api_key=api_key,
+                model_id=model_id,
+                sys_prompt=sys_prompt,
+                question=q,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
 
-                ans = safe_call_one(
-                    api_key=api_key,
-                    model_id=model_id,
-                    sys_prompt=sys_prompt,
-                    question=q,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
+            rows.append({
+                "conversation_id": idx,
+                "model": model_id,
+                "messages": [
+                    {"role": "user", "content": q},
+                    {"role": "assistant", "content": ans},
+                ],
+            })
 
-                rows.append({
-                    "conversation_id": idx,
-                    "prompt_id": prompt_id,     # ✅ NEW
-                    "model": model_id,
-                    "messages": [
-                        {"role": "user", "content": q},
-                        {"role": "assistant", "content": ans},
-                    ],
-                })
-
-                done += 1
-                prog.progress(min(1.0, done / total_calls))
+            done += 1
+            prog.progress(min(1.0, done / total_calls))
 
     df = pd.DataFrame(rows)
     if not df.empty and "conversation_id" in df.columns:
@@ -567,29 +563,14 @@ if st.session_state.get("embed_status_lines"):
         else:
             st.success(line)
 
-# -----------------------
-# ✅ MINIMAL CHANGE: Two prompt control groups (A and B)
-# -----------------------
+# ✅ Rename expander title and inner label wording as requested
 with st.expander("🧠 Structured Prompt Controls", expanded=True):
     st.subheader("Prompt Settings")
-
-    colP1, colP2 = st.columns(2)
-
-    with colP1:
-        st.markdown("### Prompt A")
-        task_A = st.text_area("Task (A)", value=DEFAULT_TASK, height=90)
-        data_rules_A = st.text_area("Data Access (Strict) (A)", value=DEFAULT_DATA_RULES, height=140)
-        style_A = st.text_area("Style (Persona + Tone) (A)", value=DEFAULT_STYLE, height=210)
-        decision_rule_A = st.text_area("Decision Rule (A)", value=DEFAULT_DECISION_RULE, height=110)
-        output_rules_A = st.text_area("Output Rules (A)", value=DEFAULT_OUTPUT_RULES, height=100)
-
-    with colP2:
-        st.markdown("### Prompt B")
-        task_B = st.text_area("Task (B)", value=DEFAULT_TASK, height=90)
-        data_rules_B = st.text_area("Data Access (Strict) (B)", value=DEFAULT_DATA_RULES, height=140)
-        style_B = st.text_area("Style (Persona + Tone) (B)", value=DEFAULT_STYLE, height=210)
-        decision_rule_B = st.text_area("Decision Rule (B)", value=DEFAULT_DECISION_RULE, height=110)
-        output_rules_B = st.text_area("Output Rules (B)", value=DEFAULT_OUTPUT_RULES, height=100)
+    task = st.text_area("Task", value=DEFAULT_TASK, height=90)
+    data_rules = st.text_area("Data Access (Strict)", value=DEFAULT_DATA_RULES, height=140)
+    style = st.text_area("Style (Persona + Tone)", value=DEFAULT_STYLE, height=210)
+    decision_rule = st.text_area("Decision Rule", value=DEFAULT_DECISION_RULE, height=110)
+    output_rules = st.text_area("Output Rules", value=DEFAULT_OUTPUT_RULES, height=100)
 
 st.subheader("Actions")
 a1 = st.columns(1)[0]
@@ -617,7 +598,7 @@ if st.session_state.last_confirm_result:
 # Batch Evaluation Section
 # -----------------------
 st.divider()
-st.header("📊 Batch Evaluation (Run Questions × Selectable LLMs × Prompt A/B)")
+st.header("📊 Batch Evaluation (Run Questions × Selectable LLMs)")
 
 colA, colB = st.columns([2, 1])
 with colA:
@@ -651,27 +632,14 @@ if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
     if st.session_state.vector_db is None or not st.session_state.vector_db_ready:
         st.warning("RAG is not ready. Please upload CSVs and click 'Load & Embed CSVs' first.")
     else:
-        prompts = {
-            "A": {
-                "task": task_A,
-                "data_rules": data_rules_A,
-                "style": style_A,
-                "decision_rule": decision_rule_A,
-                "output_rules": output_rules_A,
-            },
-            "B": {
-                "task": task_B,
-                "data_rules": data_rules_B,
-                "style": style_B,
-                "decision_rule": decision_rule_B,
-                "output_rules": output_rules_B,
-            },
-        }
-
-        with st.spinner("Running batch… this will call (Prompt A + Prompt B) for each LLM and each question."):
+        with st.spinner("Running batch… this will call the selected model(s) for each question."):
             df = run_batch_eval(
                 api_key=api_key,
-                prompts=prompts,
+                task=task,
+                data_rules=data_rules,
+                style=style,
+                decision_rule=decision_rule,
+                output_rules=output_rules,
                 questions=questions,
                 selected_models=selected_models,
                 top_k=int(top_k),
@@ -679,7 +647,6 @@ if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
                 max_tokens=int(batch_max_tokens),
             )
 
-        # Note: you are not generating rag_context in df currently, so this is kept for compatibility
         if not include_context_col and "rag_context" in df.columns:
             df = df.drop(columns=["rag_context"])
 
@@ -719,7 +686,7 @@ if st.session_state.batch_df is not None:
     )
 
 # -----------------------
-# Chat UI (unchanged)
+# Chat UI
 # -----------------------
 st.divider()
 st.header("💬 Chat (Single LLM)")
@@ -763,8 +730,7 @@ if user_msg:
         with st.expander("🔎 Retrieved RAG Context (Debug)", expanded=True):
             st.text(context)
 
-    # Use Prompt A for single chat by default (simple/minimal)
-    sys_prompt = build_system_prompt(task_A, data_rules_A, style_A, decision_rule_A, output_rules_A, context)
+    sys_prompt = build_system_prompt(task, data_rules, style, decision_rule, output_rules, context)
 
     with st.chat_message("assistant"):
         try:
