@@ -1,14 +1,17 @@
-# STREAMLIT APP with RAG + Batch Runner
-# ✅ Minimal change: batch now runs BOTH Prompt A and Prompt B
+# STREAMLIT APP with RAG + Batch Runner (BATCH-ONLY)
+# ✅ Minimal change: removed single chat UI + removed "Chat LLM (Single Chat Mode)" selector
+# ✅ Keeps: OpenRouter API key input + Show RAG Debug + CSV upload/embed + batch runner
+# ✅ Batch runs BOTH Prompt A and Prompt B:
 #    Loop: question -> model -> prompt_id in {A,B}
-# ✅ Saves prompt_id in batch results (wide + long CSV)
-# ✅ Keeps JSON download (now includes prompt_id too)
+# ✅ Batch CSV download outputs an R-friendly LONG format:
+#    conversation_id, prompt_id, llm, llm_label, role, content, product_recommended
+# ✅ JSON download includes prompt_id too
 
 import io
 import json
 import time
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import pandas as pd
 import requests
@@ -31,8 +34,6 @@ def get_embed_model():
 # State
 # -----------------------
 def init_state():
-    if "chat" not in st.session_state:
-        st.session_state.chat = []
     if "llm_confirmed" not in st.session_state:
         st.session_state.llm_confirmed = False
     if "last_confirm_result" not in st.session_state:
@@ -67,7 +68,6 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     return model.encode(texts).tolist()
 
 
-# ✅ robust card builder (case-insensitive + includes SKU + never empty unless row truly empty)
 def _row_to_product_card(row: pd.Series) -> str:
     row_dict = {}
     for k, v in row.items():
@@ -375,8 +375,7 @@ def extract_product_recommended(assistant_text: str) -> str:
 
 
 # -----------------------
-# convert batch_df (wide) -> R-friendly long CSV
-# ✅ now includes prompt_id column
+# convert batch_df (wide) -> R-friendly long CSV (includes prompt_id)
 # -----------------------
 def batch_df_to_r_long(df: pd.DataFrame, label_map: Dict[str, str]) -> pd.DataFrame:
     cols = ["conversation_id", "prompt_id", "llm", "llm_label", "role", "content", "product_recommended"]
@@ -422,7 +421,7 @@ def batch_df_to_r_long(df: pd.DataFrame, label_map: Dict[str, str]) -> pd.DataFr
 
 
 # -----------------------
-# ✅ MINIMAL CHANGE: run_batch_eval now loops prompt_id in {A,B}
+# run_batch_eval loops prompt_id in {A,B}
 # -----------------------
 def run_batch_eval(
     api_key: str,
@@ -444,7 +443,7 @@ def run_batch_eval(
     for idx, q in enumerate(questions, start=1):
         rag_context = rag_retrieve_context(q, top_k=top_k)
 
-        for label, model_id in model_items:
+        for _label, model_id in model_items:
             for prompt_id, p in prompt_items:
                 sys_prompt = build_system_prompt(
                     task=p["task"],
@@ -466,7 +465,7 @@ def run_batch_eval(
 
                 rows.append({
                     "conversation_id": idx,
-                    "prompt_id": prompt_id,     # ✅ NEW
+                    "prompt_id": prompt_id,
                     "model": model_id,
                     "messages": [
                         {"role": "user", "content": q},
@@ -484,32 +483,19 @@ def run_batch_eval(
 
 
 # -----------------------
-# Streamlit UI Start
+# Streamlit UI Start (BATCH ONLY)
 # -----------------------
 init_state()
 
-st.set_page_config(page_title="ODI Grips Chatbot (RAG)", page_icon="🚵", layout="wide")
-st.title("🚵 ODI Grips Chatbot (with RAG)")
+st.set_page_config(page_title="ODI Grips Batch Eval (RAG)", page_icon="🚵", layout="wide")
+st.title("🚵 ODI Grips Batch Evaluation (with RAG)")
 
-MODEL_PRESETS = {
-    "GPT (OpenAI) — GPT-4.1 Mini": "openai/gpt-4.1-mini",
-    "GPT (OpenAI) — GPT-4.1 (larger)": "openai/gpt-4.1",
-    "Claude (Anthropic) — Claude Sonnet 4.5": "anthropic/claude-sonnet-4.5",
-    "Gemini (Google) — Gemini 2.5 Flash": "google/gemini-2.5-flash",
-    "Custom (type your own model ID)": "__custom__",
-}
+# Fixed model used only for "Confirm LLM Setup" ping
+PING_MODEL = "openai/gpt-4.1-mini"
 
 with st.sidebar:
     st.header("LLM Settings")
     api_key = st.text_input("OpenRouter API Key", type="password")
-
-    model_choice = st.selectbox("Chat LLM (Single Chat Mode)", list(MODEL_PRESETS.keys()), index=0)
-    if MODEL_PRESETS[model_choice] == "__custom__":
-        model = st.text_input("Model (OpenRouter ID)", value="openai/gpt-4.1-mini")
-    else:
-        model = MODEL_PRESETS[model_choice]
-        st.caption(f"Using model: `{model}`")
-
     show_debug = st.checkbox("Show RAG Debug (retrieved context)", value=False)
 
 if show_debug and st.session_state.datasets:
@@ -567,9 +553,6 @@ if st.session_state.get("embed_status_lines"):
         else:
             st.success(line)
 
-# -----------------------
-# ✅ MINIMAL CHANGE: Two prompt control groups (A and B)
-# -----------------------
 with st.expander("🧠 Structured Prompt Controls", expanded=True):
     st.subheader("Prompt Settings")
 
@@ -602,7 +585,7 @@ with a1:
             try:
                 ping_system = "You are a helpful assistant. Reply exactly with 'LLM OK'."
                 ping_messages = [{"role": "user", "content": "LLM OK"}]
-                out = call_llm_openrouter(api_key, model, ping_system, ping_messages, temperature=0.0, max_tokens=50)
+                out = call_llm_openrouter(api_key, PING_MODEL, ping_system, ping_messages, temperature=0.0, max_tokens=50)
                 st.session_state.llm_confirmed = "LLM OK" in out
                 st.session_state.last_confirm_result = f"Response: {out}"
                 st.toast("LLM setup checked.")
@@ -614,7 +597,7 @@ if st.session_state.last_confirm_result:
     st.info(st.session_state.last_confirm_result)
 
 # -----------------------
-# Batch Evaluation Section
+# Batch Evaluation Section (only)
 # -----------------------
 st.divider()
 st.header("📊 Batch Evaluation (Run Questions × Selectable LLMs × Prompt A/B)")
@@ -630,7 +613,6 @@ with colB:
     top_k = st.number_input("RAG top_k", min_value=1, max_value=15, value=15, step=1)
     batch_temp = st.slider("Batch temperature", min_value=0.0, max_value=1.0, value=0.2, step=0.05)
     batch_max_tokens = st.number_input("Batch max_tokens", min_value=100, max_value=2000, value=600, step=50)
-    include_context_col = st.checkbox("Include rag_context column in downloads", value=True)
 
     selected_labels = st.multiselect(
         "Choose LLM(s) to run in batch",
@@ -679,10 +661,6 @@ if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
                 max_tokens=int(batch_max_tokens),
             )
 
-        # Note: you are not generating rag_context in df currently, so this is kept for compatibility
-        if not include_context_col and "rag_context" in df.columns:
-            df = df.drop(columns=["rag_context"])
-
         st.session_state.batch_df = df
         st.session_state.batch_last_run = time.strftime("%Y-%m-%d %H:%M:%S")
         st.success(f"Batch finished at {st.session_state.batch_last_run}. Rows: {len(df)}")
@@ -717,59 +695,3 @@ if st.session_state.batch_df is not None:
         mime="application/json",
         use_container_width=True,
     )
-
-# -----------------------
-# Chat UI (unchanged)
-# -----------------------
-st.divider()
-st.header("💬 Chat (Single LLM)")
-
-chat_a1, chat_a2 = st.columns(2)
-with chat_a1:
-    if st.button("🧹 Clear Chat History", use_container_width=True):
-        st.session_state.chat = []
-        st.toast("Chat history cleared.")
-
-with chat_a2:
-    def transcript_json():
-        return json.dumps(
-            [{"conversation_id": 1, "model": model, "messages": st.session_state.chat}],
-            indent=2,
-            ensure_ascii=False,
-        )
-
-    st.download_button(
-        "⬇️ Download Transcript",
-        data=transcript_json().encode("utf-8"),
-        file_name="chat_transcript.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-
-for m in st.session_state.chat:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
-
-user_msg = st.chat_input("Ask something...")
-if user_msg:
-    st.session_state.chat.append({"role": "user", "content": user_msg})
-    with st.chat_message("user"):
-        st.markdown(user_msg)
-
-    st.caption(f"Single Chat RAG top_k = {int(top_k)}")
-    context = rag_retrieve_context(user_msg, top_k=int(top_k))
-
-    if show_debug:
-        with st.expander("🔎 Retrieved RAG Context (Debug)", expanded=True):
-            st.text(context)
-
-    # Use Prompt A for single chat by default (simple/minimal)
-    sys_prompt = build_system_prompt(task_A, data_rules_A, style_A, decision_rule_A, output_rules_A, context)
-
-    with st.chat_message("assistant"):
-        try:
-            reply = call_llm_openrouter(api_key, model, sys_prompt, st.session_state.chat)
-            st.markdown(reply)
-            st.session_state.chat.append({"role": "assistant", "content": reply})
-        except Exception as e:
-            st.error(str(e))
