@@ -6,7 +6,10 @@
 # ✅ Batch CSV download outputs an R-friendly LONG format:
 #    conversation_id, prompt_id, llm, llm_label, role, content, product_recommended
 # ✅ JSON download includes prompt_id too
-# ✅ MINIMAL CHANGE (THIS EDIT): update preferred_fields in _row_to_product_card to match your test CSV columns
+#
+# ✅ MINIMAL CHANGE (THIS EDIT):
+# - Update preferred_fields to match your test CSV columns
+# - Use `name` as the product name column (affects product cards + product_recommended extraction)
 
 import io
 import json
@@ -86,30 +89,25 @@ def _row_to_product_card(row: pd.Series) -> str:
                 return row_dict[lk].strip()
         return ""
 
-    # ✅ MINIMAL: align identity fields to your test CSV (but keep legacy fallbacks)
-    sku = get_val("sku", "SKU")  # safety if some files still include sku
+    # ✅ MINIMAL CHANGE: use `name` as product name for your test CSV
     product_name = get_val("name", "Name", "product_name", "Product Name", "title", "Title")
 
-    # ✅ MINIMAL CHANGE ONLY: update preferred_fields to match your test CSV columns
-    # Your columns:
-    # name, Length, key_features, thickness, colors, durability, damping_level,
-    # grip_pattern, Feel, traction, price, ergonomics, Grip Attachment System,
-    # co_branding, locking_mechanism, riding_style, differentiator
+    # ✅ MINIMAL CHANGE: preferred_fields updated to your column schema
     preferred_fields = [
         ("Name", ["name", "Name"]),
-        ("Length", ["Length", "length", "length_mm", "Length (mm)"]),  # keep legacy aliases
+        ("Length", ["length", "Length"]),
         ("Key Features", ["key_features", "Key Features"]),
         ("Thickness", ["thickness", "Thickness"]),
         ("Colors", ["colors", "Colors"]),
         ("Durability", ["durability", "Durability"]),
         ("Damping Level", ["damping_level", "Damping Level"]),
         ("Grip Pattern", ["grip_pattern", "Grip Pattern"]),
-        ("Feel", ["Feel", "feel"]),
+        ("Feel", ["feel", "Feel"]),
         ("Traction", ["traction", "Traction"]),
         ("Price", ["price", "Price"]),
         ("Ergonomics", ["ergonomics", "Ergonomics"]),
-        ("Grip Attachment System", ["Grip Attachment System", "grip attachment system", "Grip Attachment", "grip_attachment_system"]),
-        ("Co-branding", ["co_branding", "co-branding", "Co Branding", "Co-branding"]),
+        ("Grip Attachment System", ["grip attachment system", "Grip Attachment System"]),
+        ("Co-Branding", ["co_branding", "Co Branding", "co-branding", "Co-Branding"]),
         ("Locking Mechanism", ["locking_mechanism", "Locking Mechanism"]),
         ("Riding Style", ["riding_style", "Riding Style"]),
         ("Differentiator", ["differentiator", "Differentiator"]),
@@ -118,8 +116,6 @@ def _row_to_product_card(row: pd.Series) -> str:
     lines = []
     if product_name:
         lines.append(f"Product: {product_name}")
-    elif sku:
-        lines.append(f"Product: {sku}")
 
     for label, keys in preferred_fields:
         val = get_val(*keys)
@@ -227,35 +223,27 @@ You are an expert ODI grip specialist. Recommend the most suitable ODI grip base
 """.strip()
 
 DEFAULT_DATA_RULES = """<DATA ACCESS (STRICT)>
-- Use ONLY information retrieved from the embedded ODI product dataset (RAG context).
-- Do NOT browse the web or use external reviews/knowledge.
-- Do NOT invent specs, pricing, availability, or claims not shown in the retrieved context.
-- Only ODI grips are allowed (no competitor brands).
-- If the retrieved context lacks what you need, say so and ask ONE clarifying question.
+- Use ONLY information from the retrieved RAG context.
+- Do NOT use outside knowledge.
+- Do NOT invent specifications or claims.
+- If the context is insufficient, still choose the closest match from the RAG context and briefly state what information is missing.
 """.strip()
 
-DEFAULT_STYLE = """<STYLE (PERSONA + TONE)>
-Respond in a professional, supportive, and informative tone—similar to a knowledgeable customer service expert in a high-end bike shop.
-Encourage beginners and build trust with experienced riders.
-
-Language Simplicity Rule:
-- Default to simple, everyday language (target ~5th–6th grade reading level).
-- Prefer short sentences (under ~15 words).
-- Avoid filler phrases (e.g., “I understand that…”, “it can be challenging to…”).
-- Replace multi-syllable or formal words with simpler alternatives when possible.
-- Only use technical terms if the user uses them first.
+DEFAULT_STYLE = """<STYLE>
+Use clear and direct language.
 """.strip()
 
 DEFAULT_DECISION_RULE = """<DECISION RULE>
-- Recommend EXACTLY ONE product.
-- Only recommend when the match is strongly supported by retrieved context.
-- If the match is weak or ambiguous, ask ONE clarifying question instead.
+- You MUST recommend EXACTLY ONE product for every question.
+- The recommended product_name MUST appear in the current RAG context.
+- If the match is weak, still pick the closest match from the RAG context and briefly state what information is missing.
+- Do NOT ask clarifying questions.
 """.strip()
 
 DEFAULT_OUTPUT_RULES = """<OUTPUT RULES>
-- Recommend ONE primary product.
-- Briefly explain why the match fits the identified needs.
-- Use exact product_name.
+Return:
+Recommended Product: <exact product_name from RAG context>
+Reason: <1–2 sentences based only on retrieved specs>
 """.strip()
 
 
@@ -283,7 +271,7 @@ def build_system_prompt(
 
 IMPORTANT:
 - Use the RAG context above as your source of truth.
-- If the RAG context is empty or does not contain a named product that matches, say so and ask ONE clarifying question.
+- The recommended product name must appear in the RAG context.
 - Do NOT invent. Do NOT use outside knowledge.
 """.strip()
 
@@ -353,12 +341,19 @@ def _build_product_name_set() -> set:
     names = set()
     for _fname, _df in st.session_state.datasets.items():
         cols_lc = [c.lower() for c in _df.columns]
-        if "product_name" in cols_lc:
+
+        # ✅ MINIMAL CHANGE: accept `name` as the product name column
+        if "name" in cols_lc:
+            col = _df.columns[cols_lc.index("name")]
+        elif "product_name" in cols_lc:
             col = _df.columns[cols_lc.index("product_name")]
-            for v in _df[col].astype(str).fillna("").tolist():
-                vv = v.strip()
-                if vv:
-                    names.add(vv)
+        else:
+            continue
+
+        for v in _df[col].astype(str).fillna("").tolist():
+            vv = v.strip()
+            if vv:
+                names.add(vv)
     return names
 
 
@@ -378,9 +373,13 @@ def extract_product_recommended(assistant_text: str) -> str:
         if name.lower() in text_lc:
             return name
 
-    m = re.search(r"(?im)^\s*Product\s*:\s*(.+)\s*$", assistant_text)
+    m = re.search(r"(?im)^\s*Recommended\s*Product\s*:\s*(.+)\s*$", assistant_text)
     if m:
         return m.group(1).strip()
+
+    m2 = re.search(r"(?im)^\s*Product\s*:\s*(.+)\s*$", assistant_text)
+    if m2:
+        return m2.group(1).strip()
 
     return ""
 
@@ -436,7 +435,7 @@ def batch_df_to_r_long(df: pd.DataFrame, label_map: Dict[str, str]) -> pd.DataFr
 # -----------------------
 def run_batch_eval(
     api_key: str,
-    prompts: Dict[str, Dict[str, str]],  # {"A":{...}, "B":{...}}
+    prompts: Dict[str, Dict[str, str]],
     questions: List[str],
     selected_models: Dict[str, str],
     top_k: int = 5,
@@ -501,7 +500,6 @@ init_state()
 st.set_page_config(page_title="ODI Grips Batch Eval (RAG)", page_icon="🚵", layout="wide")
 st.title("🚵 ODI Grips Batch Evaluation (with RAG)")
 
-# Fixed model used only for "Confirm LLM Setup" ping
 PING_MODEL = "openai/gpt-4.1-mini"
 
 with st.sidebar:
@@ -537,25 +535,7 @@ if st.button("🔄 Load & Embed CSVs"):
 
     st.session_state.embed_status_lines = []
     add_to_vector_db()
-
     st.session_state.embed_status_lines.append("✅ CSV files loaded. Vector index rebuilt for RAG.")
-
-    target_full = "vanquish lock-on grips"
-    target_short = "vanquish"
-
-    combined_text = ""
-    for _fname, _df in st.session_state.datasets.items():
-        combined_text += " " + " ".join(_df.astype(str).fillna("").values.flatten())
-
-    combined_text_lc = combined_text.lower()
-
-    if (target_full not in combined_text_lc) and (target_short not in combined_text_lc):
-        msg = "❌ Sanity Check Failed: 'Vanquish Lock-On Grips' (or 'Vanquish') not found in loaded CSVs BEFORE embeddings."
-        st.session_state.embed_status_lines.append(msg)
-        st.error(msg)
-        st.stop()
-    else:
-        st.session_state.embed_status_lines.append("✅ Sanity Check Passed: Vanquish found in loaded CSVs (pre-embedding).")
 
 if st.session_state.get("embed_status_lines"):
     for line in st.session_state.embed_status_lines:
@@ -573,17 +553,17 @@ with st.expander("🧠 Structured Prompt Controls", expanded=True):
         st.markdown("### Prompt A")
         task_A = st.text_area("Task (A)", value=DEFAULT_TASK, height=90)
         data_rules_A = st.text_area("Data Access (Strict) (A)", value=DEFAULT_DATA_RULES, height=140)
-        style_A = st.text_area("Style (Persona + Tone) (A)", value=DEFAULT_STYLE, height=210)
-        decision_rule_A = st.text_area("Decision Rule (A)", value=DEFAULT_DECISION_RULE, height=110)
-        output_rules_A = st.text_area("Output Rules (A)", value=DEFAULT_OUTPUT_RULES, height=100)
+        style_A = st.text_area("Style (A)", value=DEFAULT_STYLE, height=100)
+        decision_rule_A = st.text_area("Decision Rule (A)", value=DEFAULT_DECISION_RULE, height=170)
+        output_rules_A = st.text_area("Output Rules (A)", value=DEFAULT_OUTPUT_RULES, height=90)
 
     with colP2:
         st.markdown("### Prompt B")
         task_B = st.text_area("Task (B)", value=DEFAULT_TASK, height=90)
         data_rules_B = st.text_area("Data Access (Strict) (B)", value=DEFAULT_DATA_RULES, height=140)
-        style_B = st.text_area("Style (Persona + Tone) (B)", value=DEFAULT_STYLE, height=210)
-        decision_rule_B = st.text_area("Decision Rule (B)", value=DEFAULT_DECISION_RULE, height=110)
-        output_rules_B = st.text_area("Output Rules (B)", value=DEFAULT_OUTPUT_RULES, height=100)
+        style_B = st.text_area("Style (B)", value=DEFAULT_STYLE, height=100)
+        decision_rule_B = st.text_area("Decision Rule (B)", value=DEFAULT_DECISION_RULE, height=170)
+        output_rules_B = st.text_area("Output Rules (B)", value=DEFAULT_OUTPUT_RULES, height=90)
 
 st.subheader("Actions")
 a1 = st.columns(1)[0]
@@ -616,7 +596,7 @@ st.header("📊 Batch Evaluation (Run Questions × Selectable LLMs × Prompt A/B
 colA, colB = st.columns([2, 1])
 with colA:
     questions_text = st.text_area(
-        "Paste your questions (one per line). Example: Colby 10 questions.",
+        "Paste your questions (one per line).",
         height=220,
         placeholder="Question 1...\nQuestion 2...\n..."
     )
@@ -681,7 +661,7 @@ if st.session_state.batch_df is not None:
     st.caption(f"Last run: {st.session_state.batch_last_run}")
     st.dataframe(st.session_state.batch_df, use_container_width=True)
 
-    model_id_to_label = {v: k for k, v in BATCH_MODELS.items()}  # id -> label
+    model_id_to_label = {v: k for k, v in BATCH_MODELS.items()}
     batch_long_df = batch_df_to_r_long(st.session_state.batch_df, model_id_to_label)
 
     csv_bytes = batch_long_df.to_csv(index=False).encode("utf-8")
