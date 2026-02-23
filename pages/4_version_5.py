@@ -1,15 +1,14 @@
 # STREAMLIT APP with RAG + Batch Runner (BATCH-ONLY)
 # ✅ MINIMAL CHANGE (SYSTEM-LEVEL IMPROVEMENT):
-# - Store product attributes as Chroma metadata (attachment/thickness/damping/style/product_name)
+# - Store product attributes as Chroma metadata (attach/thickness/damping/style/product_name)
 # - Parse user question into simple constraints
 # - Use metadata filtering (where=...) during retrieval + fallback if too strict
-# Everything else stays the same
+# ✅ Fix: embed ALL rows (no "skipped existing" issue) by resetting the collection on every Load & Embed
 
-import io
 import json
 import time
 import re
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
@@ -53,10 +52,17 @@ def init_state():
 
 
 # -----------------------
-# RAG Functions
+# Vector DB (reset each time you embed)
 # -----------------------
 def init_vector_db():
     client = chromadb.Client()  # in-memory
+
+    # Force reset collection so IDs don't "already exist"
+    try:
+        client.delete_collection(name="odi-grips")
+    except Exception:
+        pass
+
     st.session_state.vector_db = client.get_or_create_collection(name="odi-grips")
     st.session_state.vector_db_ready = True
 
@@ -71,6 +77,7 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
 # -----------------------
 _DASHES = r"[\u2010\u2011\u2012\u2013\u2014\u2212]"  # normalize weird dashes to '-'
 
+
 def _norm_text(x: str) -> str:
     if x is None:
         return ""
@@ -79,10 +86,11 @@ def _norm_text(x: str) -> str:
     x = re.sub(r"\s+", " ", x).strip()
     return x
 
+
 def parse_constraints(question: str) -> Dict[str, str]:
     """
-    Very simple keyword rules -> metadata filters.
-    Keep this minimal and expand later if you want.
+    Simple keyword rules -> metadata filters.
+    Keep minimal; fallback logic prevents "too strict" empty results.
     """
     q = _norm_text(question)
     c: Dict[str, str] = {}
@@ -93,13 +101,13 @@ def parse_constraints(question: str) -> Dict[str, str]:
     if "slip-on" in q or "slip on" in q:
         c["attach"] = "slip-on"
 
-    # thickness (basic keywords)
+    # thickness
     if "thin" in q or "small hand" in q or "small hands" in q:
         c["thickness"] = "thin"
     if "thick" in q or "large hand" in q or "large hands" in q:
         c["thickness"] = "thick"
 
-    # dampening / pain cues -> high damping
+    # damping / pain cues -> high damping
     if any(w in q for w in ["vibration", "numb", "numbness", "hand pain", "tingling", "sore", "hurt"]):
         c["damping"] = "high"
 
@@ -116,6 +124,9 @@ def parse_constraints(question: str) -> Dict[str, str]:
     return c
 
 
+# -----------------------
+# Row -> Product card (document text)
+# -----------------------
 def _row_to_product_card(row: pd.Series) -> str:
     row_dict = {}
     for k, v in row.items():
@@ -133,10 +144,8 @@ def _row_to_product_card(row: pd.Series) -> str:
                 return row_dict[lk].strip()
         return ""
 
-    # ✅ use `name` as product name for your test CSV
     product_name = get_val("name", "Name", "product_name", "Product Name", "title", "Title")
 
-    # ✅ preferred_fields updated to your column schema
     preferred_fields = [
         ("Name", ["name", "Name"]),
         ("Length", ["length", "Length"]),
@@ -183,7 +192,7 @@ def _row_to_product_card(row: pd.Series) -> str:
 
 
 # -----------------------
-# MINIMAL ADD: extract metadata for filtering
+# Row -> Metadata (for filtering)
 # -----------------------
 def _row_to_metadata(fname: str, i: int, row: pd.Series) -> Dict[str, str]:
     row_dict = {}
@@ -203,47 +212,37 @@ def _row_to_metadata(fname: str, i: int, row: pd.Series) -> Dict[str, str]:
         return ""
 
     product_name = get_val("name", "Name", "product_name", "Product Name", "title", "Title")
-
     attach_raw = get_val("Grip Attachment System", "grip attachment system")
     thickness_raw = get_val("Thickness", "thickness")
     damping_raw = get_val("Damping Level", "damping_level")
     style_raw = get_val("Riding Style", "riding_style")
 
-    attach = _norm_text(attach_raw).replace("lock on", "lock-on")
+    attach = _norm_text(attach_raw).replace("lock on", "lock-on").replace("slip on", "slip-on")
     thickness = _norm_text(thickness_raw)
     damping = _norm_text(damping_raw)
     style = _norm_text(style_raw)
 
-    # Keep only simple/consistent tokens (optional small normalization)
-    # These are your filter keys: attach/thickness/damping/style
-    meta = {
+    return {
         "source": fname,
         "row_index": int(i),
-        "product_name": product_name.strip(),
+        "product_name": (product_name or "").strip(),
         "attach": attach if attach else "unknown",
         "thickness": thickness if thickness else "unknown",
         "damping": damping if damping else "unknown",
         "style": style if style else "unknown",
     }
-    return meta
 
 
+# -----------------------
+# Embed all rows into Chroma
+# -----------------------
 def add_to_vector_db():
     if st.session_state.vector_db is None:
         init_vector_db()
 
-    existing_ids = set()
-    try:
-        peek = st.session_state.vector_db.peek()
-        for _id in peek.get("ids", []):
-            existing_ids.add(_id)
-    except Exception:
-        pass
-
-    all_texts, ids, metadata = [], [], []
+    all_texts, ids, metadatas = [], [], []
     total_rows = 0
-    skipped_existing = 0
-    skipped_truly_empty = 0
+    skipped_empty = 0
 
     for fname, df in st.session_state.datasets.items():
         df = df.reset_index(drop=True)
@@ -251,25 +250,17 @@ def add_to_vector_db():
 
         for i, row in df.iterrows():
             chunk_id = f"{fname}::row-{i}"
-            if chunk_id in existing_ids:
-                skipped_existing += 1
-                continue
 
             card = _row_to_product_card(row)
             if not card.strip():
-                skipped_truly_empty += 1
+                skipped_empty += 1
                 continue
 
             all_texts.append(card)
             ids.append(chunk_id)
+            metadatas.append(_row_to_metadata(fname, i, row))
 
-            # ✅ MINIMAL CHANGE: store useful metadata for filtering
-            metadata.append(_row_to_metadata(fname, i, row))
-
-    st.info(
-        f"Loaded rows: {total_rows} | Embedded: {len(all_texts)} | "
-        f"Skipped existing: {skipped_existing} | Skipped empty rows: {skipped_truly_empty}"
-    )
+    st.info(f"Loaded rows: {total_rows} | Embedded: {len(all_texts)} | Skipped empty rows: {skipped_empty}")
 
     if not all_texts:
         st.info("No rows to embed (empty dataset).")
@@ -277,21 +268,22 @@ def add_to_vector_db():
 
     embeddings = embed_texts(all_texts)
 
-    if not (len(all_texts) == len(ids) == len(metadata) == len(embeddings)):
-        st.error("Embedding batch length mismatch. Please check your CSV rows.")
-        return
-
     st.session_state.vector_db.add(
         documents=all_texts,
         embeddings=embeddings,
         ids=ids,
-        metadatas=metadata,
+        metadatas=metadatas,
     )
     st.success(f"Embedded {len(all_texts)} product rows.")
 
+    try:
+        st.caption(f"Vector DB count: {st.session_state.vector_db.count()}")
+    except Exception:
+        pass
+
 
 # -----------------------
-# MINIMAL CHANGE: retrieval uses metadata filters + fallback
+# Retrieval with metadata filter + fallback
 # -----------------------
 def rag_retrieve_context(query: str, top_k: int = 5) -> str:
     if st.session_state.vector_db is None or not st.session_state.vector_db_ready:
@@ -299,38 +291,36 @@ def rag_retrieve_context(query: str, top_k: int = 5) -> str:
 
     constraints = parse_constraints(query)
 
-    def _do_query(where: Dict[str, str] | None, k: int):
+    def _do_query(where: Optional[Dict[str, str]], k: int):
         embedded_query = embed_texts([query])[0]
         return st.session_state.vector_db.query(
             query_embeddings=[embedded_query],
             n_results=k,
-            where=where
+            where=where,
         )
 
-    # Try with constraints first
+    # 1) try strict constraints
     where = constraints if constraints else None
-    results = _do_query(where, top_k)
-
-    docs = results.get("documents", [[]])
+    res = _do_query(where, top_k)
+    docs = res.get("documents", [[]])
     if docs and docs[0]:
         return "\n\n---\n\n".join(docs[0])
 
-    # Fallback strategy (minimal): drop style first, then drop thickness, then drop damping, then unfiltered
+    # 2) relax one-by-one (drop the most specific filters first)
     fallback_order = ["style", "thickness", "damping", "attach"]
     relaxed = dict(constraints)
 
     for key in fallback_order:
         if key in relaxed:
             relaxed.pop(key, None)
-            where2 = relaxed if relaxed else None
-            results2 = _do_query(where2, top_k)
-            docs2 = results2.get("documents", [[]])
+            res2 = _do_query(relaxed if relaxed else None, top_k)
+            docs2 = res2.get("documents", [[]])
             if docs2 and docs2[0]:
                 return "\n\n---\n\n".join(docs2[0])
 
-    # Final fallback: unfiltered
-    results3 = _do_query(None, top_k)
-    docs3 = results3.get("documents", [[]])
+    # 3) final fallback: unfiltered
+    res3 = _do_query(None, top_k)
+    docs3 = res3.get("documents", [[]])
     if docs3 and docs3[0]:
         return "\n\n---\n\n".join(docs3[0])
 
@@ -375,7 +365,7 @@ def build_system_prompt(
     style: str,
     decision_rule: str,
     output_rules: str,
-    rag_context: str
+    rag_context: str,
 ) -> str:
     return f"""
 {task}
@@ -490,6 +480,7 @@ def extract_product_recommended(assistant_text: str) -> str:
 
     text_lc = assistant_text.lower()
 
+    # longest match first
     for name in sorted(product_names, key=len, reverse=True):
         if name.lower() in text_lc:
             return name
@@ -534,15 +525,17 @@ def batch_df_to_r_long(df: pd.DataFrame, label_map: Dict[str, str]) -> pd.DataFr
         for m in msgs:
             if not isinstance(m, dict):
                 continue
-            out_rows.append({
-                "conversation_id": conv_id,
-                "prompt_id": prompt_id,
-                "llm": llm,
-                "llm_label": llm_label,
-                "role": m.get("role", ""),
-                "content": m.get("content", ""),
-                "product_recommended": prod if m.get("role") == "assistant" else "",
-            })
+            out_rows.append(
+                {
+                    "conversation_id": conv_id,
+                    "prompt_id": prompt_id,
+                    "llm": llm,
+                    "llm_label": llm_label,
+                    "role": m.get("role", ""),
+                    "content": m.get("content", ""),
+                    "product_recommended": prod if m.get("role") == "assistant" else "",
+                }
+            )
 
     long_df = pd.DataFrame(out_rows)
     for c in cols:
@@ -582,7 +575,7 @@ def run_batch_eval(
                     style=p["style"],
                     decision_rule=p["decision_rule"],
                     output_rules=p["output_rules"],
-                    rag_context=rag_context
+                    rag_context=rag_context,
                 )
 
                 ans = safe_call_one(
@@ -594,15 +587,17 @@ def run_batch_eval(
                     max_tokens=max_tokens,
                 )
 
-                rows.append({
-                    "conversation_id": idx,
-                    "prompt_id": prompt_id,
-                    "model": model_id,
-                    "messages": [
-                        {"role": "user", "content": q},
-                        {"role": "assistant", "content": ans},
-                    ],
-                })
+                rows.append(
+                    {
+                        "conversation_id": idx,
+                        "prompt_id": prompt_id,
+                        "model": model_id,
+                        "messages": [
+                            {"role": "user", "content": q},
+                            {"role": "assistant", "content": ans},
+                        ],
+                    }
+                )
 
                 done += 1
                 prog.progress(min(1.0, done / total_calls))
@@ -638,18 +633,14 @@ st.subheader("📁 Upload CSV Files")
 csv_files = st.file_uploader("Upload ODI product CSVs", type=["csv"], accept_multiple_files=True)
 
 if st.button("🔄 Load & Embed CSVs"):
+    # reset vector db each time you embed to avoid "already exist" / partial embedding issues
     st.session_state.vector_db = None
     st.session_state.vector_db_ready = False
     init_vector_db()
 
     st.session_state.datasets = {}
     for f in csv_files:
-        df = pd.read_csv(
-            f,
-            dtype=str,
-            engine="python",
-            keep_default_na=False
-        )
+        df = pd.read_csv(f, dtype=str, engine="python", keep_default_na=False)
         df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
         df = df.fillna("")
         st.session_state.datasets[f.name] = df
@@ -719,19 +710,15 @@ with colA:
     questions_text = st.text_area(
         "Paste your questions (one per line).",
         height=220,
-        placeholder="Question 1...\nQuestion 2...\n..."
+        placeholder="Question 1...\nQuestion 2...\n...",
     )
 with colB:
     top_k = st.number_input("RAG top_k", min_value=1, max_value=15, value=5, step=1)
     batch_temp = st.slider("Batch temperature", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
     batch_max_tokens = st.number_input("Batch max_tokens", min_value=100, max_value=2000, value=600, step=50)
 
-    # ✅ MINIMAL CHANGE: choose run mode
-    run_mode = st.radio(
-        "Run mode",
-        options=["Run A + B", "Run A only", "Run B only"],
-        index=0
-    )
+    # run mode
+    run_mode = st.radio("Run mode", options=["Run A + B", "Run A only", "Run B only"], index=0)
 
     selected_labels = st.multiselect(
         "Choose LLM(s) to run in batch",
@@ -769,7 +756,7 @@ if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
             },
         }
 
-        # ✅ MINIMAL CHANGE: filter prompts by run_mode
+        # filter prompts by run_mode
         if run_mode == "Run A only":
             prompts = {"A": prompts_all["A"]}
         elif run_mode == "Run B only":
@@ -809,12 +796,7 @@ if st.session_state.batch_df is not None:
         use_container_width=True,
     )
 
-    json_bytes = json.dumps(
-        st.session_state.batch_df.to_dict(orient="records"),
-        indent=2,
-        ensure_ascii=False
-    ).encode("utf-8")
-
+    json_bytes = json.dumps(st.session_state.batch_df.to_dict(orient="records"), indent=2, ensure_ascii=False).encode("utf-8")
     st.download_button(
         "⬇️ Download JSON (.json)",
         data=json_bytes,
