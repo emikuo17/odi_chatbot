@@ -1,15 +1,6 @@
 # STREAMLIT APP with RAG + Batch Runner (BATCH-ONLY)
-# ✅ Minimal change: removed single chat UI + removed "Chat LLM (Single Chat Mode)" selector
-# ✅ Keeps: OpenRouter API key input + Show RAG Debug + CSV upload/embed + batch runner
-# ✅ Batch runs BOTH Prompt A and Prompt B:
-#    Loop: question -> model -> prompt_id in {A,B}
-# ✅ Batch CSV download outputs an R-friendly LONG format:
-#    conversation_id, prompt_id, llm, llm_label, role, content, product_recommended
-# ✅ JSON download includes prompt_id too
-#
-# ✅ MINIMAL CHANGE (THIS EDIT):
-# - Update preferred_fields to match your test CSV columns
-# - Use `name` as the product name column (affects product cards + product_recommended extraction)
+# ✅ Minimal change: add "Run mode" so you can run A only, B only, or A+B
+# ✅ Everything else stays the same
 
 import io
 import json
@@ -89,10 +80,10 @@ def _row_to_product_card(row: pd.Series) -> str:
                 return row_dict[lk].strip()
         return ""
 
-    # ✅ MINIMAL CHANGE: use `name` as product name for your test CSV
+    # ✅ use `name` as product name for your test CSV
     product_name = get_val("name", "Name", "product_name", "Product Name", "title", "Title")
 
-    # ✅ MINIMAL CHANGE: preferred_fields updated to your column schema
+    # ✅ preferred_fields updated to your column schema
     preferred_fields = [
         ("Name", ["name", "Name"]),
         ("Length", ["length", "Length"]),
@@ -342,7 +333,6 @@ def _build_product_name_set() -> set:
     for _fname, _df in st.session_state.datasets.items():
         cols_lc = [c.lower() for c in _df.columns]
 
-        # ✅ MINIMAL CHANGE: accept `name` as the product name column
         if "name" in cols_lc:
             col = _df.columns[cols_lc.index("name")]
         elif "product_name" in cols_lc:
@@ -605,6 +595,13 @@ with colB:
     batch_temp = st.slider("Batch temperature", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
     batch_max_tokens = st.number_input("Batch max_tokens", min_value=100, max_value=2000, value=600, step=50)
 
+    # ✅ MINIMAL CHANGE: choose run mode
+    run_mode = st.radio(
+        "Run mode",
+        options=["Run A + B", "Run A only", "Run B only"],
+        index=0
+    )
+
     selected_labels = st.multiselect(
         "Choose LLM(s) to run in batch",
         options=list(BATCH_MODELS.keys()),
@@ -624,7 +621,7 @@ if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
     if st.session_state.vector_db is None or not st.session_state.vector_db_ready:
         st.warning("RAG is not ready. Please upload CSVs and click 'Load & Embed CSVs' first.")
     else:
-        prompts = {
+        prompts_all = {
             "A": {
                 "task": task_A,
                 "data_rules": data_rules_A,
@@ -641,7 +638,15 @@ if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
             },
         }
 
-        with st.spinner("Running batch… this will call (Prompt A + Prompt B) for each LLM and each question."):
+        # ✅ MINIMAL CHANGE: filter prompts by run_mode
+        if run_mode == "Run A only":
+            prompts = {"A": prompts_all["A"]}
+        elif run_mode == "Run B only":
+            prompts = {"B": prompts_all["B"]}
+        else:
+            prompts = prompts_all
+
+        with st.spinner("Running batch… this will call the selected prompt(s) for each LLM and each question."):
             df = run_batch_eval(
                 api_key=api_key,
                 prompts=prompts,
