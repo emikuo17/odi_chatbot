@@ -1,14 +1,16 @@
 # STREAMLIT APP with RAG + Batch Runner (BATCH-ONLY)
-# ✅ MINIMAL CHANGE (SYSTEM-LEVEL IMPROVEMENT):
+# ✅ System-level improvement:
 # - Store product attributes as Chroma metadata (attach/thickness/damping/style/product_name)
 # - Parse user question into simple constraints
 # - Use metadata filtering (where=...) during retrieval + fallback if too strict
-# ✅ Fix: embed ALL rows (no "skipped existing" issue) by resetting the collection on every Load & Embed
+# ✅ Fix:
+# - Build Chroma "where" filter with $and / $eq so it won't crash
+# - Reset the collection on every Load & Embed so IDs don’t "already exist"
 
 import json
 import time
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 import pandas as pd
 import requests
@@ -73,7 +75,7 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
 
 
 # -----------------------
-# MINIMAL ADD: normalize + constraint parsing
+# Normalize + constraint parsing
 # -----------------------
 _DASHES = r"[\u2010\u2011\u2012\u2013\u2014\u2212]"  # normalize weird dashes to '-'
 
@@ -122,6 +124,26 @@ def parse_constraints(question: str) -> Dict[str, str]:
         c["style"] = "trail"
 
     return c
+
+
+# -----------------------
+# Build Chroma where filter safely (fixes your crash)
+# -----------------------
+def build_where_from_constraints(constraints: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """
+    Convert {"attach":"lock-on","damping":"high"} ->
+    {"$and":[{"attach":{"$eq":"lock-on"}},{"damping":{"$eq":"high"}}]}
+    Works with Chroma versions that require a single top-level operator.
+    """
+    if not constraints:
+        return None
+
+    clauses = [{k: {"$eq": v}} for k, v in constraints.items() if v and v != "unknown"]
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
 
 
 # -----------------------
@@ -283,7 +305,7 @@ def add_to_vector_db():
 
 
 # -----------------------
-# Retrieval with metadata filter + fallback
+# Retrieval with metadata filter + fallback (SAFE where format)
 # -----------------------
 def rag_retrieve_context(query: str, top_k: int = 5) -> str:
     if st.session_state.vector_db is None or not st.session_state.vector_db_ready:
@@ -291,7 +313,7 @@ def rag_retrieve_context(query: str, top_k: int = 5) -> str:
 
     constraints = parse_constraints(query)
 
-    def _do_query(where: Optional[Dict[str, str]], k: int):
+    def _do_query(where: Optional[Dict[str, Any]], k: int):
         embedded_query = embed_texts([query])[0]
         return st.session_state.vector_db.query(
             query_embeddings=[embedded_query],
@@ -300,20 +322,21 @@ def rag_retrieve_context(query: str, top_k: int = 5) -> str:
         )
 
     # 1) try strict constraints
-    where = constraints if constraints else None
+    where = build_where_from_constraints(constraints)
     res = _do_query(where, top_k)
     docs = res.get("documents", [[]])
     if docs and docs[0]:
         return "\n\n---\n\n".join(docs[0])
 
-    # 2) relax one-by-one (drop the most specific filters first)
+    # 2) relax one-by-one
     fallback_order = ["style", "thickness", "damping", "attach"]
     relaxed = dict(constraints)
 
     for key in fallback_order:
         if key in relaxed:
             relaxed.pop(key, None)
-            res2 = _do_query(relaxed if relaxed else None, top_k)
+            where2 = build_where_from_constraints(relaxed)
+            res2 = _do_query(where2, top_k)
             docs2 = res2.get("documents", [[]])
             if docs2 and docs2[0]:
                 return "\n\n---\n\n".join(docs2[0])
@@ -410,7 +433,7 @@ def call_llm_openrouter(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "HTTP-Referer": "http://localhost:8501",
-        "X-Title": "ODI Grips Chatbot with RAG",
+        "X-Title": "ODI Grips Batch Eval (RAG)",
     }
     resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
 
@@ -633,7 +656,7 @@ st.subheader("📁 Upload CSV Files")
 csv_files = st.file_uploader("Upload ODI product CSVs", type=["csv"], accept_multiple_files=True)
 
 if st.button("🔄 Load & Embed CSVs"):
-    # reset vector db each time you embed to avoid "already exist" / partial embedding issues
+    # reset vector db each time you embed
     st.session_state.vector_db = None
     st.session_state.vector_db_ready = False
     init_vector_db()
@@ -688,7 +711,9 @@ with a1:
             try:
                 ping_system = "You are a helpful assistant. Reply exactly with 'LLM OK'."
                 ping_messages = [{"role": "user", "content": "LLM OK"}]
-                out = call_llm_openrouter(api_key, PING_MODEL, ping_system, ping_messages, temperature=0.0, max_tokens=50)
+                out = call_llm_openrouter(
+                    api_key, PING_MODEL, ping_system, ping_messages, temperature=0.0, max_tokens=50
+                )
                 st.session_state.llm_confirmed = "LLM OK" in out
                 st.session_state.last_confirm_result = f"Response: {out}"
                 st.toast("LLM setup checked.")
@@ -698,6 +723,7 @@ with a1:
 
 if st.session_state.last_confirm_result:
     st.info(st.session_state.last_confirm_result)
+
 
 # -----------------------
 # Batch Evaluation Section (only)
@@ -717,7 +743,6 @@ with colB:
     batch_temp = st.slider("Batch temperature", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
     batch_max_tokens = st.number_input("Batch max_tokens", min_value=100, max_value=2000, value=600, step=50)
 
-    # run mode
     run_mode = st.radio("Run mode", options=["Run A + B", "Run A only", "Run B only"], index=0)
 
     selected_labels = st.multiselect(
@@ -734,6 +759,7 @@ if (not api_key) or (len(questions) == 0):
     st.caption("To run batch: enter API key + paste at least 1 question. Also upload & embed CSVs for real RAG results.")
 elif len(selected_models) == 0:
     st.caption("Select at least one LLM to run.")
+
 
 if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
     if st.session_state.vector_db is None or not st.session_state.vector_db_ready:
@@ -756,7 +782,6 @@ if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
             },
         }
 
-        # filter prompts by run_mode
         if run_mode == "Run A only":
             prompts = {"A": prompts_all["A"]}
         elif run_mode == "Run B only":
@@ -779,6 +804,7 @@ if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
         st.session_state.batch_last_run = time.strftime("%Y-%m-%d %H:%M:%S")
         st.success(f"Batch finished at {st.session_state.batch_last_run}. Rows: {len(df)}")
 
+
 if st.session_state.batch_df is not None:
     st.subheader("✅ Batch Results")
     st.caption(f"Last run: {st.session_state.batch_last_run}")
@@ -796,7 +822,12 @@ if st.session_state.batch_df is not None:
         use_container_width=True,
     )
 
-    json_bytes = json.dumps(st.session_state.batch_df.to_dict(orient="records"), indent=2, ensure_ascii=False).encode("utf-8")
+    json_bytes = json.dumps(
+        st.session_state.batch_df.to_dict(orient="records"),
+        indent=2,
+        ensure_ascii=False,
+    ).encode("utf-8")
+
     st.download_button(
         "⬇️ Download JSON (.json)",
         data=json_bytes,
