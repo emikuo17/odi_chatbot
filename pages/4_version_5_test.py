@@ -1,16 +1,13 @@
 # STREAMLIT APP with RAG + Batch Runner (BATCH-ONLY)
-# ✅ System-level improvement:
-# - Store product attributes as Chroma metadata (attach/thickness/damping/style/product_name)
-# - Parse user question into simple constraints
-# - Use metadata filtering (where=...) during retrieval + fallback if too strict
-# ✅ Fix:
-# - Build Chroma "where" filter with $and / $eq so it won't crash
-# - Reset the collection on every Load & Embed so IDs don’t "already exist"
+# ✅ Minimal change: add built-in rule-based filtering/scoring before retrieval
+# ✅ Keeps existing UI mostly the same
+# ✅ No extra rule CSV upload needed
 
+import io
 import json
 import time
 import re
-from typing import Dict, List, Optional, Any
+from typing import Dict, List
 
 import pandas as pd
 import requests
@@ -19,6 +16,94 @@ import streamlit as st
 # RAG Libraries
 import chromadb
 from sentence_transformers import SentenceTransformer
+
+
+# -----------------------
+# Built-in Rule Catalog
+# -----------------------
+RULE_CATALOG = [
+    {
+        "rule_group": "hand_size_thickness_large",
+        "trigger_keywords": ["large hands", "bigger hands", "thick", "thicker", "large diameter", "xl", "oversized"],
+        "target_columns": ["thickness", "key_features", "feel", "ergonomics", "differentiator"],
+        "positive_patterns": ["thick", "large", "xl", "oversized"],
+        "negative_patterns": [],
+        "score": 4,
+        "reason": "large-hand/thick preference",
+    },
+    {
+        "rule_group": "hand_size_thickness_small",
+        "trigger_keywords": ["small hands", "thin", "slim", "narrow", "ultra narrow", "not bulky"],
+        "target_columns": ["thickness", "key_features", "feel", "ergonomics", "differentiator"],
+        "positive_patterns": ["thin", "slim", "narrow", "small"],
+        "negative_patterns": ["bulky", "oversized", "extra thick"],
+        "score": 4,
+        "reason": "small-hand/thin preference",
+    },
+    {
+        "rule_group": "comfort_damping",
+        "trigger_keywords": ["pain", "hurting", "comfort", "comfortable", "shock absorption", "damping", "vibration", "fatigue", "soft", "plush", "squishy", "cushion", "cushioning"],
+        "target_columns": ["damping_level", "feel", "ergonomics", "key_features", "differentiator"],
+        "positive_patterns": ["high damping", "damping", "comfort", "ergonomic", "shock", "vibration", "plush", "soft"],
+        "negative_patterns": ["firm", "race-focused", "direct feel"],
+        "score": 4,
+        "reason": "comfort/pain/damping preference",
+    },
+    {
+        "rule_group": "riding_style_bmx",
+        "trigger_keywords": ["bmx", "slalom"],
+        "target_columns": ["riding_style", "co_branding", "differentiator", "key_features"],
+        "positive_patterns": ["bmx", "slalom"],
+        "negative_patterns": [],
+        "score": 4,
+        "reason": "bmx/slalom riding style match",
+    },
+    {
+        "rule_group": "riding_style_trail_enduro",
+        "trigger_keywords": ["trail", "enduro", "all mountain"],
+        "target_columns": ["riding_style", "differentiator", "key_features"],
+        "positive_patterns": ["trail", "enduro", "all mountain"],
+        "negative_patterns": [],
+        "score": 3,
+        "reason": "trail/enduro riding style match",
+    },
+    {
+        "rule_group": "riding_style_xc",
+        "trigger_keywords": ["xc", "cross country"],
+        "target_columns": ["riding_style", "key_features", "differentiator"],
+        "positive_patterns": ["xc", "cross country"],
+        "negative_patterns": [],
+        "score": 4,
+        "reason": "xc riding style match",
+    },
+    {
+        "rule_group": "wet_weather_traction",
+        "trigger_keywords": ["wet", "rain", "slick", "winter wet", "whistler"],
+        "target_columns": ["traction", "grip_pattern", "key_features", "differentiator"],
+        "positive_patterns": ["wet", "traction", "waffle", "channel", "debris"],
+        "negative_patterns": [],
+        "score": 3,
+        "reason": "wet-weather traction preference",
+    },
+    {
+        "rule_group": "traction_pattern_control",
+        "trigger_keywords": ["traction", "control", "quick reaction", "consistent feel", "waffle", "tacky", "direct feel"],
+        "target_columns": ["traction", "grip_pattern", "feel", "key_features"],
+        "positive_patterns": ["waffle", "traction", "tacky", "consistent", "direct", "pattern"],
+        "negative_patterns": [],
+        "score": 2,
+        "reason": "traction/pattern/control preference",
+    },
+    {
+        "rule_group": "durability",
+        "trigger_keywords": ["durable", "rugged", "reinforced", "wear down quickly", "hard end cap", "no gloves"],
+        "target_columns": ["durability", "differentiator", "key_features", "locking_mechanism"],
+        "positive_patterns": ["durable", "rugged", "reinforced", "hard end", "protection"],
+        "negative_patterns": [],
+        "score": 3,
+        "reason": "durability preference",
+    },
+]
 
 
 # -----------------------
@@ -54,17 +139,134 @@ def init_state():
 
 
 # -----------------------
-# Vector DB (reset each time you embed)
+# Text / Rule Helpers
+# -----------------------
+def _norm_text(x: str) -> str:
+    return re.sub(r"\s+", " ", str(x).strip().lower())
+
+
+def _canonical_col_map(df: pd.DataFrame) -> Dict[str, str]:
+    return {str(c).strip().lower(): c for c in df.columns}
+
+
+def get_row_text_for_columns(row: pd.Series, columns: List[str]) -> str:
+    row_map = {str(c).strip().lower(): str(v).strip() for c, v in row.items()}
+    parts = []
+    for col in columns:
+        val = row_map.get(col.lower(), "")
+        if val:
+            parts.append(val.lower())
+    return " | ".join(parts)
+
+
+def score_products_by_rules(question: str, df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df.copy()
+
+    out = df.copy().reset_index(drop=True)
+    out["rule_score"] = 0
+    out["rule_reasons"] = ""
+
+    q = _norm_text(question)
+    col_map = _canonical_col_map(out)
+
+    def add_score(mask, points: int, reason: str):
+        if isinstance(mask, bool):
+            return
+        out.loc[mask, "rule_score"] += points
+        out.loc[mask, "rule_reasons"] = (
+            out.loc[mask, "rule_reasons"].astype(str) + f"; {reason}"
+        ).str.strip("; ").str.strip()
+
+    # --------------------
+    # Hard filters
+    # --------------------
+    if any(x in q for x in ["lock on", "lock-on"]):
+        lock_col = col_map.get("locking_mechanism")
+        if lock_col:
+            out = out[out[lock_col].astype(str).str.contains("lock", case=False, na=False)].copy()
+            col_map = _canonical_col_map(out)
+
+    color_words = ["purple", "black", "white", "gum", "gumwall"]
+    mentioned_colors = [c for c in color_words if c in q]
+    color_col = col_map.get("colors")
+    if mentioned_colors and color_col:
+        mask = pd.Series(False, index=out.index)
+        for color in mentioned_colors:
+            mask = mask | out[color_col].astype(str).str.contains(color, case=False, na=False)
+        out = out[mask].copy()
+        col_map = _canonical_col_map(out)
+
+    if out.empty:
+        return out
+
+    # --------------------
+    # Rule scoring
+    # --------------------
+    for rule in RULE_CATALOG:
+        if not any(kw in q for kw in rule["trigger_keywords"]):
+            continue
+
+        blob = out.apply(lambda row: get_row_text_for_columns(row, rule["target_columns"]), axis=1)
+
+        positive_mask = pd.Series(False, index=out.index)
+        for pat in rule["positive_patterns"]:
+            positive_mask = positive_mask | blob.str.contains(re.escape(pat), case=False, regex=True, na=False)
+
+        add_score(positive_mask, int(rule["score"]), str(rule["reason"]))
+
+        for neg_pat in rule["negative_patterns"]:
+            negative_mask = blob.str.contains(re.escape(neg_pat), case=False, regex=True, na=False)
+            add_score(negative_mask, -max(1, int(rule["score"]) - 1), f"penalty: {rule['reason']}")
+
+    # --------------------
+    # Budget rule
+    # --------------------
+    if any(x in q for x in ["budget", "affordable", "cheap", "less expensive"]):
+        price_col = col_map.get("price")
+        if price_col:
+            price_num = (
+                out[price_col].astype(str)
+                .str.replace(r"[^0-9.]", "", regex=True)
+                .replace("", pd.NA)
+            )
+            out["_price_num"] = pd.to_numeric(price_num, errors="coerce")
+            if out["_price_num"].notna().any():
+                threshold = out["_price_num"].median()
+                add_score(out["_price_num"] <= threshold, 3, "budget preference")
+
+    out = out.sort_values(["rule_score"], ascending=False).reset_index(drop=True)
+    return out
+
+
+def get_rule_filtered_candidates(question: str, top_n_candidates: int = 8) -> pd.DataFrame:
+    if not st.session_state.datasets:
+        return pd.DataFrame()
+
+    frames = []
+    for fname, df in st.session_state.datasets.items():
+        temp = df.copy()
+        temp["_source_file"] = fname
+        frames.append(temp)
+
+    full_df = pd.concat(frames, ignore_index=True)
+    scored_df = score_products_by_rules(question, full_df)
+
+    if scored_df.empty:
+        return pd.DataFrame()
+
+    return scored_df.head(top_n_candidates).copy()
+
+
+def _dot_similarity(vec_a: List[float], vec_b: List[float]) -> float:
+    return float(sum(a * b for a, b in zip(vec_a, vec_b)))
+
+
+# -----------------------
+# RAG Functions
 # -----------------------
 def init_vector_db():
     client = chromadb.Client()  # in-memory
-
-    # Force reset collection so IDs don't "already exist"
-    try:
-        client.delete_collection(name="odi-grips")
-    except Exception:
-        pass
-
     st.session_state.vector_db = client.get_or_create_collection(name="odi-grips")
     st.session_state.vector_db_ready = True
 
@@ -74,81 +276,6 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     return model.encode(texts).tolist()
 
 
-# -----------------------
-# Normalize + constraint parsing
-# -----------------------
-_DASHES = r"[\u2010\u2011\u2012\u2013\u2014\u2212]"  # normalize weird dashes to '-'
-
-
-def _norm_text(x: str) -> str:
-    if x is None:
-        return ""
-    x = str(x).strip().lower()
-    x = re.sub(_DASHES, "-", x)
-    x = re.sub(r"\s+", " ", x).strip()
-    return x
-
-
-def parse_constraints(question: str) -> Dict[str, str]:
-    """
-    Simple keyword rules -> metadata filters.
-    Keep minimal; fallback logic prevents "too strict" empty results.
-    """
-    q = _norm_text(question)
-    c: Dict[str, str] = {}
-
-    # attachment / system
-    if "lock-on" in q or "lock on" in q:
-        c["attach"] = "lock-on"
-    if "slip-on" in q or "slip on" in q:
-        c["attach"] = "slip-on"
-
-    # thickness
-    if "thin" in q or "small hand" in q or "small hands" in q:
-        c["thickness"] = "thin"
-    if "thick" in q or "large hand" in q or "large hands" in q:
-        c["thickness"] = "thick"
-
-    # damping / pain cues -> high damping
-    if any(w in q for w in ["vibration", "numb", "numbness", "hand pain", "tingling", "sore", "hurt"]):
-        c["damping"] = "high"
-
-    # riding style
-    if "bmx" in q:
-        c["style"] = "bmx"
-    elif "downhill" in q or re.search(r"\bdh\b", q):
-        c["style"] = "dh"
-    elif "xc" in q or "cross country" in q:
-        c["style"] = "xc"
-    elif "trail" in q:
-        c["style"] = "trail"
-
-    return c
-
-
-# -----------------------
-# Build Chroma where filter safely (fixes your crash)
-# -----------------------
-def build_where_from_constraints(constraints: Dict[str, str]) -> Optional[Dict[str, Any]]:
-    """
-    Convert {"attach":"lock-on","damping":"high"} ->
-    {"$and":[{"attach":{"$eq":"lock-on"}},{"damping":{"$eq":"high"}}]}
-    Works with Chroma versions that require a single top-level operator.
-    """
-    if not constraints:
-        return None
-
-    clauses = [{k: {"$eq": v}} for k, v in constraints.items() if v and v != "unknown"]
-    if not clauses:
-        return None
-    if len(clauses) == 1:
-        return clauses[0]
-    return {"$and": clauses}
-
-
-# -----------------------
-# Row -> Product card (document text)
-# -----------------------
 def _row_to_product_card(row: pd.Series) -> str:
     row_dict = {}
     for k, v in row.items():
@@ -213,58 +340,22 @@ def _row_to_product_card(row: pd.Series) -> str:
     return "\n".join(lines).strip()
 
 
-# -----------------------
-# Row -> Metadata (for filtering)
-# -----------------------
-def _row_to_metadata(fname: str, i: int, row: pd.Series) -> Dict[str, str]:
-    row_dict = {}
-    for k, v in row.items():
-        kk = str(k).strip()
-        vv = "" if v is None else str(v).strip()
-        row_dict[kk] = vv
-        row_dict[kk.lower()] = vv
-
-    def get_val(*keys: str) -> str:
-        for key in keys:
-            if key in row_dict and row_dict[key].strip() != "":
-                return row_dict[key].strip()
-            lk = key.lower()
-            if lk in row_dict and row_dict[lk].strip() != "":
-                return row_dict[lk].strip()
-        return ""
-
-    product_name = get_val("name", "Name", "product_name", "Product Name", "title", "Title")
-    attach_raw = get_val("Grip Attachment System", "grip attachment system")
-    thickness_raw = get_val("Thickness", "thickness")
-    damping_raw = get_val("Damping Level", "damping_level")
-    style_raw = get_val("Riding Style", "riding_style")
-
-    attach = _norm_text(attach_raw).replace("lock on", "lock-on").replace("slip on", "slip-on")
-    thickness = _norm_text(thickness_raw)
-    damping = _norm_text(damping_raw)
-    style = _norm_text(style_raw)
-
-    return {
-        "source": fname,
-        "row_index": int(i),
-        "product_name": (product_name or "").strip(),
-        "attach": attach if attach else "unknown",
-        "thickness": thickness if thickness else "unknown",
-        "damping": damping if damping else "unknown",
-        "style": style if style else "unknown",
-    }
-
-
-# -----------------------
-# Embed all rows into Chroma
-# -----------------------
 def add_to_vector_db():
     if st.session_state.vector_db is None:
         init_vector_db()
 
-    all_texts, ids, metadatas = [], [], []
+    existing_ids = set()
+    try:
+        peek = st.session_state.vector_db.peek()
+        for _id in peek.get("ids", []):
+            existing_ids.add(_id)
+    except Exception:
+        pass
+
+    all_texts, ids, metadata = [], [], []
     total_rows = 0
-    skipped_empty = 0
+    skipped_existing = 0
+    skipped_truly_empty = 0
 
     for fname, df in st.session_state.datasets.items():
         df = df.reset_index(drop=True)
@@ -272,17 +363,23 @@ def add_to_vector_db():
 
         for i, row in df.iterrows():
             chunk_id = f"{fname}::row-{i}"
+            if chunk_id in existing_ids:
+                skipped_existing += 1
+                continue
 
             card = _row_to_product_card(row)
             if not card.strip():
-                skipped_empty += 1
+                skipped_truly_empty += 1
                 continue
 
             all_texts.append(card)
             ids.append(chunk_id)
-            metadatas.append(_row_to_metadata(fname, i, row))
+            metadata.append({"source": fname, "row_index": int(i)})
 
-    st.info(f"Loaded rows: {total_rows} | Embedded: {len(all_texts)} | Skipped empty rows: {skipped_empty}")
+    st.info(
+        f"Loaded rows: {total_rows} | Embedded: {len(all_texts)} | "
+        f"Skipped existing: {skipped_existing} | Skipped empty rows: {skipped_truly_empty}"
+    )
 
     if not all_texts:
         st.info("No rows to embed (empty dataset).")
@@ -290,64 +387,93 @@ def add_to_vector_db():
 
     embeddings = embed_texts(all_texts)
 
+    if not (len(all_texts) == len(ids) == len(metadata) == len(embeddings)):
+        st.error("Embedding batch length mismatch. Please check your CSV rows.")
+        return
+
     st.session_state.vector_db.add(
         documents=all_texts,
         embeddings=embeddings,
         ids=ids,
-        metadatas=metadatas,
+        metadatas=metadata,
     )
     st.success(f"Embedded {len(all_texts)} product rows.")
 
-    try:
-        st.caption(f"Vector DB count: {st.session_state.vector_db.count()}")
-    except Exception:
-        pass
 
-
-# -----------------------
-# Retrieval with metadata filter + fallback (SAFE where format)
-# -----------------------
-def rag_retrieve_context(query: str, top_k: int = 5) -> str:
+def rag_retrieve_context_basic(query: str, top_k: int = 5):
     if st.session_state.vector_db is None or not st.session_state.vector_db_ready:
-        return "No embedded product data available. Please load and embed CSVs first."
+        return "No embedded product data available. Please load and embed CSVs first.", []
 
-    constraints = parse_constraints(query)
+    embedded_query = embed_texts([query])[0]
+    results = st.session_state.vector_db.query(
+        query_embeddings=[embedded_query],
+        n_results=top_k,
+    )
 
-    def _do_query(where: Optional[Dict[str, Any]], k: int):
-        embedded_query = embed_texts([query])[0]
-        return st.session_state.vector_db.query(
-            query_embeddings=[embedded_query],
-            n_results=k,
-            where=where,
-        )
+    docs = results.get("documents", [[]])
+    metas = results.get("metadatas", [[]])
 
-    # 1) try strict constraints
-    where = build_where_from_constraints(constraints)
-    res = _do_query(where, top_k)
-    docs = res.get("documents", [[]])
-    if docs and docs[0]:
-        return "\n\n---\n\n".join(docs[0])
+    if not docs or not docs[0]:
+        return "No matching context.", []
 
-    # 2) relax one-by-one
-    fallback_order = ["style", "thickness", "damping", "attach"]
-    relaxed = dict(constraints)
+    retrieval_debug = []
+    for rank, doc in enumerate(docs[0], start=1):
+        product_name = ""
+        m = re.search(r"(?im)^Product:\s*(.+)$", doc)
+        if m:
+            product_name = m.group(1).strip()
 
-    for key in fallback_order:
-        if key in relaxed:
-            relaxed.pop(key, None)
-            where2 = build_where_from_constraints(relaxed)
-            res2 = _do_query(where2, top_k)
-            docs2 = res2.get("documents", [[]])
-            if docs2 and docs2[0]:
-                return "\n\n---\n\n".join(docs2[0])
+        meta = metas[0][rank - 1] if metas and metas[0] and len(metas[0]) >= rank else {}
+        retrieval_debug.append({
+            "rank": rank,
+            "product_name": product_name,
+            "similarity_score": "",
+            "rule_score": "",
+            "rule_reasons": "",
+            "source": meta.get("source", "") if isinstance(meta, dict) else "",
+        })
 
-    # 3) final fallback: unfiltered
-    res3 = _do_query(None, top_k)
-    docs3 = res3.get("documents", [[]])
-    if docs3 and docs3[0]:
-        return "\n\n---\n\n".join(docs3[0])
+    return "\n\n---\n\n".join(docs[0]), retrieval_debug
 
-    return "No matching context."
+
+def rag_retrieve_context_filtered(question: str, top_k: int = 5, top_n_candidates: int = 8):
+    candidates = get_rule_filtered_candidates(question, top_n_candidates=top_n_candidates)
+
+    # Fallback to original vector DB retrieval if rule filtering yields nothing
+    if candidates.empty:
+        return rag_retrieve_context_basic(question, top_k=top_k)
+
+    candidate_cards = candidates.apply(_row_to_product_card, axis=1).tolist()
+
+    col_map = _canonical_col_map(candidates)
+    name_col = col_map.get("name") or col_map.get("product_name")
+    candidate_names = candidates[name_col].astype(str).tolist() if name_col else [""] * len(candidates)
+
+    embedded_query = embed_texts([question])[0]
+    candidate_embeddings = embed_texts(candidate_cards)
+
+    scored = []
+    for idx, emb in enumerate(candidate_embeddings):
+        sim = _dot_similarity(embedded_query, emb)
+        scored.append((idx, sim))
+
+    scored = sorted(scored, key=lambda x: x[1], reverse=True)[:top_k]
+
+    selected_docs = []
+    retrieval_debug = []
+
+    for rank, (idx, sim) in enumerate(scored, start=1):
+        selected_docs.append(candidate_cards[idx])
+        retrieval_debug.append({
+            "rank": rank,
+            "product_name": candidate_names[idx],
+            "similarity_score": round(sim, 4),
+            "rule_score": int(candidates.iloc[idx].get("rule_score", 0)),
+            "rule_reasons": str(candidates.iloc[idx].get("rule_reasons", "")),
+            "source": str(candidates.iloc[idx].get("_source_file", "")),
+        })
+
+    return "\n\n---\n\n".join(selected_docs), retrieval_debug
 
 
 # -----------------------
@@ -388,7 +514,7 @@ def build_system_prompt(
     style: str,
     decision_rule: str,
     output_rules: str,
-    rag_context: str,
+    rag_context: str
 ) -> str:
     return f"""
 {task}
@@ -433,7 +559,7 @@ def call_llm_openrouter(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "HTTP-Referer": "http://localhost:8501",
-        "X-Title": "ODI Grips Batch Eval (RAG)",
+        "X-Title": "ODI Grips Chatbot with RAG",
     }
     resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
 
@@ -503,7 +629,6 @@ def extract_product_recommended(assistant_text: str) -> str:
 
     text_lc = assistant_text.lower()
 
-    # longest match first
     for name in sorted(product_names, key=len, reverse=True):
         if name.lower() in text_lc:
             return name
@@ -523,7 +648,12 @@ def extract_product_recommended(assistant_text: str) -> str:
 # convert batch_df (wide) -> R-friendly long CSV (includes prompt_id)
 # -----------------------
 def batch_df_to_r_long(df: pd.DataFrame, label_map: Dict[str, str]) -> pd.DataFrame:
-    cols = ["conversation_id", "prompt_id", "llm", "llm_label", "role", "content", "product_recommended"]
+    cols = [
+        "conversation_id", "prompt_id", "llm", "llm_label",
+        "role", "content", "product_recommended",
+        "retrieval_top_products", "retrieval_rule_summary"
+    ]
+
     if df is None or df.empty:
         return pd.DataFrame(columns=cols)
 
@@ -538,6 +668,21 @@ def batch_df_to_r_long(df: pd.DataFrame, label_map: Dict[str, str]) -> pd.DataFr
         if not isinstance(msgs, list):
             msgs = []
 
+        retrieval_debug = r.get("retrieval_debug", [])
+        if not isinstance(retrieval_debug, list):
+            retrieval_debug = []
+
+        retrieval_top_products = " | ".join(
+            [str(x.get("product_name", "")).strip() for x in retrieval_debug if str(x.get("product_name", "")).strip()]
+        )
+        retrieval_rule_summary = " | ".join(
+            [
+                f"{x.get('product_name', '')}: {x.get('rule_reasons', '')}"
+                for x in retrieval_debug
+                if str(x.get("product_name", "")).strip()
+            ]
+        )
+
         assistant_text = ""
         for m in msgs:
             if isinstance(m, dict) and m.get("role") == "assistant":
@@ -548,17 +693,17 @@ def batch_df_to_r_long(df: pd.DataFrame, label_map: Dict[str, str]) -> pd.DataFr
         for m in msgs:
             if not isinstance(m, dict):
                 continue
-            out_rows.append(
-                {
-                    "conversation_id": conv_id,
-                    "prompt_id": prompt_id,
-                    "llm": llm,
-                    "llm_label": llm_label,
-                    "role": m.get("role", ""),
-                    "content": m.get("content", ""),
-                    "product_recommended": prod if m.get("role") == "assistant" else "",
-                }
-            )
+            out_rows.append({
+                "conversation_id": conv_id,
+                "prompt_id": prompt_id,
+                "llm": llm,
+                "llm_label": llm_label,
+                "role": m.get("role", ""),
+                "content": m.get("content", ""),
+                "product_recommended": prod if m.get("role") == "assistant" else "",
+                "retrieval_top_products": retrieval_top_products if m.get("role") == "assistant" else "",
+                "retrieval_rule_summary": retrieval_rule_summary if m.get("role") == "assistant" else "",
+            })
 
     long_df = pd.DataFrame(out_rows)
     for c in cols:
@@ -578,6 +723,7 @@ def run_batch_eval(
     top_k: int = 5,
     temperature: float = 0.2,
     max_tokens: int = 600,
+    top_n_candidates: int = 8,
 ) -> pd.DataFrame:
     rows = []
     model_items = list(selected_models.items())
@@ -588,7 +734,11 @@ def run_batch_eval(
     prog = st.progress(0)
 
     for idx, q in enumerate(questions, start=1):
-        rag_context = rag_retrieve_context(q, top_k=top_k)
+        rag_context, retrieval_debug = rag_retrieve_context_filtered(
+            q,
+            top_k=top_k,
+            top_n_candidates=top_n_candidates
+        )
 
         for _label, model_id in model_items:
             for prompt_id, p in prompt_items:
@@ -598,7 +748,7 @@ def run_batch_eval(
                     style=p["style"],
                     decision_rule=p["decision_rule"],
                     output_rules=p["output_rules"],
-                    rag_context=rag_context,
+                    rag_context=rag_context
                 )
 
                 ans = safe_call_one(
@@ -610,17 +760,16 @@ def run_batch_eval(
                     max_tokens=max_tokens,
                 )
 
-                rows.append(
-                    {
-                        "conversation_id": idx,
-                        "prompt_id": prompt_id,
-                        "model": model_id,
-                        "messages": [
-                            {"role": "user", "content": q},
-                            {"role": "assistant", "content": ans},
-                        ],
-                    }
-                )
+                rows.append({
+                    "conversation_id": idx,
+                    "prompt_id": prompt_id,
+                    "model": model_id,
+                    "retrieval_debug": retrieval_debug,
+                    "messages": [
+                        {"role": "user", "content": q},
+                        {"role": "assistant", "content": ans},
+                    ],
+                })
 
                 done += 1
                 prog.progress(min(1.0, done / total_calls))
@@ -637,7 +786,7 @@ def run_batch_eval(
 init_state()
 
 st.set_page_config(page_title="ODI Grips Batch Eval (RAG)", page_icon="🚵", layout="wide")
-st.title("🚵 ODI Grips Batch Evaluation (with RAG)")
+st.title("🚵 ODI Grips Batch Evaluation (with RAG + Rule Filtering)")
 
 PING_MODEL = "openai/gpt-4.1-mini"
 
@@ -656,14 +805,18 @@ st.subheader("📁 Upload CSV Files")
 csv_files = st.file_uploader("Upload ODI product CSVs", type=["csv"], accept_multiple_files=True)
 
 if st.button("🔄 Load & Embed CSVs"):
-    # reset vector db each time you embed
     st.session_state.vector_db = None
     st.session_state.vector_db_ready = False
     init_vector_db()
 
     st.session_state.datasets = {}
     for f in csv_files:
-        df = pd.read_csv(f, dtype=str, engine="python", keep_default_na=False)
+        df = pd.read_csv(
+            f,
+            dtype=str,
+            engine="python",
+            keep_default_na=False
+        )
         df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
         df = df.fillna("")
         st.session_state.datasets[f.name] = df
@@ -711,9 +864,7 @@ with a1:
             try:
                 ping_system = "You are a helpful assistant. Reply exactly with 'LLM OK'."
                 ping_messages = [{"role": "user", "content": "LLM OK"}]
-                out = call_llm_openrouter(
-                    api_key, PING_MODEL, ping_system, ping_messages, temperature=0.0, max_tokens=50
-                )
+                out = call_llm_openrouter(api_key, PING_MODEL, ping_system, ping_messages, temperature=0.0, max_tokens=50)
                 st.session_state.llm_confirmed = "LLM OK" in out
                 st.session_state.last_confirm_result = f"Response: {out}"
                 st.toast("LLM setup checked.")
@@ -723,7 +874,6 @@ with a1:
 
 if st.session_state.last_confirm_result:
     st.info(st.session_state.last_confirm_result)
-
 
 # -----------------------
 # Batch Evaluation Section (only)
@@ -736,14 +886,19 @@ with colA:
     questions_text = st.text_area(
         "Paste your questions (one per line).",
         height=220,
-        placeholder="Question 1...\nQuestion 2...\n...",
+        placeholder="Question 1...\nQuestion 2...\n..."
     )
 with colB:
     top_k = st.number_input("RAG top_k", min_value=1, max_value=15, value=5, step=1)
+    top_n_candidates = st.number_input("Rule-filtered candidate pool", min_value=3, max_value=20, value=8, step=1)
     batch_temp = st.slider("Batch temperature", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
     batch_max_tokens = st.number_input("Batch max_tokens", min_value=100, max_value=2000, value=600, step=50)
 
-    run_mode = st.radio("Run mode", options=["Run A + B", "Run A only", "Run B only"], index=0)
+    run_mode = st.radio(
+        "Run mode",
+        options=["Run A + B", "Run A only", "Run B only"],
+        index=0
+    )
 
     selected_labels = st.multiselect(
         "Choose LLM(s) to run in batch",
@@ -759,7 +914,6 @@ if (not api_key) or (len(questions) == 0):
     st.caption("To run batch: enter API key + paste at least 1 question. Also upload & embed CSVs for real RAG results.")
 elif len(selected_models) == 0:
     st.caption("Select at least one LLM to run.")
-
 
 if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
     if st.session_state.vector_db is None or not st.session_state.vector_db_ready:
@@ -798,17 +952,29 @@ if st.button("🚀 Run Batch", disabled=run_disabled, use_container_width=True):
                 top_k=int(top_k),
                 temperature=float(batch_temp),
                 max_tokens=int(batch_max_tokens),
+                top_n_candidates=int(top_n_candidates),
             )
 
         st.session_state.batch_df = df
         st.session_state.batch_last_run = time.strftime("%Y-%m-%d %H:%M:%S")
         st.success(f"Batch finished at {st.session_state.batch_last_run}. Rows: {len(df)}")
 
-
 if st.session_state.batch_df is not None:
     st.subheader("✅ Batch Results")
     st.caption(f"Last run: {st.session_state.batch_last_run}")
     st.dataframe(st.session_state.batch_df, use_container_width=True)
+
+    if show_debug and "retrieval_debug" in st.session_state.batch_df.columns:
+        st.markdown("### 🔎 Retrieval Debug")
+        for i, row in st.session_state.batch_df.iterrows():
+            st.markdown(
+                f"**Conversation {row.get('conversation_id', '')} | Prompt {row.get('prompt_id', '')} | Model {row.get('model', '')}**"
+            )
+            dbg = row.get("retrieval_debug", [])
+            if isinstance(dbg, list) and len(dbg) > 0:
+                st.dataframe(pd.DataFrame(dbg), use_container_width=True)
+            else:
+                st.write("No retrieval debug available.")
 
     model_id_to_label = {v: k for k, v in BATCH_MODELS.items()}
     batch_long_df = batch_df_to_r_long(st.session_state.batch_df, model_id_to_label)
@@ -825,7 +991,7 @@ if st.session_state.batch_df is not None:
     json_bytes = json.dumps(
         st.session_state.batch_df.to_dict(orient="records"),
         indent=2,
-        ensure_ascii=False,
+        ensure_ascii=False
     ).encode("utf-8")
 
     st.download_button(
